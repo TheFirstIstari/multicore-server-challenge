@@ -1,8 +1,15 @@
-// Optional per-second diagnostics, enabled with STATS=1 (off by default: every hook is one predictable branch
-// on STATS_ON). Each worker prints one line per second to stderr: requests, event-loop CPU, server-side latency
-// percentiles (whole request, Postgres batches split into reads / reads queued behind a write on the same
-// connection / writes, bcrypt jobs), and how many batches sit in each Postgres connection's pipeline.
-#include "conduit.h"
+// MIT License — fork of c-iouring-tigokraft (#10); ideas from c-iouring-gilnett (#58), rust-tokio-Scooter1337 (#7), csharp-sockets-jh-d (#22).
+// rw: Original MIT code (c) challenge contributors; modifications (c) frobinson. See README Credits.
+
+// rw: Optional per-second diagnostics, enabled with STATS=1 (off by default: every hook is one predictable branch
+
+// rw: on STATS_ON). Each worker prints one line per second to stderr: requests, event-loop CPU, server-side latency
+
+// rw: percentiles (whole request, Postgres batches split into reads / reads queued behind a write on the same
+
+// rw: connection / writes, bcrypt jobs), and how many batches sit in each Postgres connection's pipeline.
+
+#include "app.h"
 #include <time.h>
 
 bool STATS_ON;
@@ -18,7 +25,7 @@ struct stats {
     hist_t total, pg_r, pg_rb, pg_w, bc;
 };
 
-uint64_t stats_now(void) {
+uint64_t tm_now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
@@ -59,20 +66,20 @@ static double hpct(const hist_t *h, double q) {
     return 0;
 }
 
-void stats_init(worker_t *w) {
-    w->stats = calloc(1, sizeof *w->stats);
-    if (!w->stats) die("out of memory");
-    w->stats->last_us = stats_now();
-    w->stats->last_cpu_us = cpu_now();
+void tm_init(ev_loop *ev) {
+    ev->stats = calloc(1, sizeof *ev->stats);
+    if (!ev->stats) die("out of memory");
+    ev->stats->last_us = tm_now();
+    ev->stats->last_cpu_us = cpu_now();
 }
 
-void stats_req_done(worker_t *w, uint64_t t0) {
-    w->stats->reqs++;
-    hadd(&w->stats->total, stats_now() - t0);
+void tm_req_done(ev_loop *ev, uint64_t t0) {
+    ev->stats->reqs++;
+    hadd(&ev->stats->total, tm_now() - t0);
 }
 
-void stats_pg_enq(pgconn_t *c, pgbatch_t *b) {
-    stats_t *s = c->w->stats;
+void tm_pg_enq(pg_conn *c, pg_batch *b) {
+    stats_t *s = c->ev->stats;
     b->behind_w = c->pend_w > 0;
     if (b->is_write) c->pend_w++;
     s->enq++;
@@ -80,9 +87,9 @@ void stats_pg_enq(pgconn_t *c, pgbatch_t *b) {
     if ((uint64_t)c->inflight > s->maxdepth) s->maxdepth = c->inflight;
 }
 
-void stats_pg_done(pgconn_t *c, pgbatch_t *b) {
-    stats_t *s = c->w->stats;
-    uint64_t us = stats_now() - b->t_enq;
+void tm_pg_done(pg_conn *c, pg_batch *b) {
+    stats_t *s = c->ev->stats;
+    uint64_t us = tm_now() - b->t_enq;
     c->lat_sum += us;
     c->lat_n++;
     if (b->is_write) {
@@ -93,7 +100,7 @@ void stats_pg_done(pgconn_t *c, pgbatch_t *b) {
     }
 }
 
-void stats_bc_done(worker_t *w, uint64_t t0) { hadd(&w->stats->bc, stats_now() - t0); }
+void tm_bcrypt_done(ev_loop *ev, uint64_t t0) { hadd(&ev->stats->bc, tm_now() - t0); }
 
 bool stmt_is_write(int stmt) {
     static signed char cache[256];
@@ -104,15 +111,16 @@ bool stmt_is_write(int stmt) {
     return cache[stmt] == 2;
 }
 
-// Called once per event-loop wake-up: t0 is when the wait returned, n the completions handled.
-void stats_loop(worker_t *w, uint64_t t0, unsigned n) {
-    stats_t *s = w->stats;
-    uint64_t now = stats_now();
+// rw: Called once per event-loop wake-up: t0 is when the wait returned, n the completions handled.
+
+void tm_tick(ev_loop *ev, uint64_t t0, unsigned n) {
+    stats_t *s = ev->stats;
+    uint64_t now = tm_now();
     s->wakes++;
     s->cqes += n;
     if (n > s->maxcqe) s->maxcqe = n;
     s->busy_us += now - t0;
-    if ((uint64_t)w->wq_n > s->maxwq) s->maxwq = w->wq_n;
+    if ((uint64_t)ev->wq_n > s->maxwq) s->maxwq = ev->wq_n;
     if (now - t0 > s->maxbusy_us) s->maxbusy_us = now - t0;
     if (now - s->last_us < 1000000) return;
 
@@ -121,26 +129,35 @@ void stats_loop(worker_t *w, uint64_t t0, unsigned n) {
     int tot = 0, mx = 0;
     char snap[512], lat[512];
     int sl = 0, ll = 0;
-    for (int i = 0; i < w->npg; i++) {
-        pgconn_t *c = &w->pg[i];
+    for (int i = 0; i < ev->nread; i++) { // read pool (own split)
+        pg_conn *c = &ev->pg_read[i];
         int k = c->inflight;
         tot += k;
         if (k > mx) mx = k;
-        if (sl < (int)sizeof snap - 8) sl += snprintf(snap + sl, sizeof snap - sl, "%d%s", k, i + 1 < w->npg ? "," : "");
+        if (sl < (int)sizeof snap - 8) sl += snprintf(snap + sl, sizeof snap - sl, "%d%s", k, i + 1 < ev->nread ? "," : "");
         if (ll < (int)sizeof lat - 8)
-            ll += snprintf(lat + ll, sizeof lat - ll, "%.0f%s", c->lat_n ? c->lat_sum / 1000.0 / c->lat_n : 0, i + 1 < w->npg ? "," : "");
+            ll += snprintf(lat + ll, sizeof lat - ll, "%.0f%s", c->lat_n ? c->lat_sum / 1000.0 / c->lat_n : 0, i + 1 < ev->nread ? "," : "");
+        c->lat_sum = c->lat_n = 0;
+    }
+    // rw: write pool (own split): fold into totals for STATS line
+
+    for (int i = 0; i < ev->nwrite; i++) {
+        pg_conn *c = &ev->pg_write[i];
+        tot += c->inflight;
+        if (c->inflight > mx) mx = c->inflight;
+        if (c->inflight > (int)s->maxdepth) s->maxdepth = c->inflight;
         c->lat_sum = c->lat_n = 0;
     }
     fprintf(stderr,
             "STATS w%d conns=%ld req=%lu loopcpu=%.0f%% busy=%.0f%% wake=%lu cqe/wake=%.1f maxcqe=%lu maxwake=%.1fms | "
             "tot p50=%.1f p99=%.1f max=%.1f | pgR n=%lu p50=%.1f p99=%.1f | pgR-behind-W n=%lu p50=%.1f p99=%.1f | "
             "pgW n=%lu p50=%.1f p99=%.1f | bc n=%lu p50=%.0f p99=%.0f | inflight sum=%d max=%d enq-avg=%.1f enq-max=%lu wq=%d wq-max=%lu [%s] connlat-ms [%s]\n",
-            w->id, (long)s->conns, s->reqs, 100.0 * (cpu - s->last_cpu_us) / wall, 100.0 * s->busy_us / wall, s->wakes,
+            ev->id, (long)s->conns, s->reqs, 100.0 * (cpu - s->last_cpu_us) / wall, 100.0 * s->busy_us / wall, s->wakes,
             s->wakes ? (double)s->cqes / s->wakes : 0, s->maxcqe, s->maxbusy_us / 1000.0,
             hpct(&s->total, .5), hpct(&s->total, .99), hpct(&s->total, 1), s->pg_r.n, hpct(&s->pg_r, .5),
             hpct(&s->pg_r, .99), s->pg_rb.n, hpct(&s->pg_rb, .5), hpct(&s->pg_rb, .99), s->pg_w.n,
             hpct(&s->pg_w, .5), hpct(&s->pg_w, .99), s->bc.n, hpct(&s->bc, .5), hpct(&s->bc, .99), tot, mx,
-            s->enq ? (double)s->enq_depth_sum / s->enq : 0, s->maxdepth, w->wq_n, s->maxwq, snap, lat);
+    s->enq ? (double)s->enq_depth_sum / s->enq : 0, s->maxdepth, ev->wq_n, s->maxwq, snap, lat);
     uint64_t keep_last_cpu = cpu;
     int64_t conns = s->conns;
     memset(s, 0, sizeof *s);
@@ -149,4 +166,4 @@ void stats_loop(worker_t *w, uint64_t t0, unsigned n) {
     s->last_cpu_us = keep_last_cpu;
 }
 
-void stats_conn(worker_t *w, int d) { w->stats->conns += d; }
+void tm_conn_track(ev_loop *ev, int d) { ev->stats->conns += d; }

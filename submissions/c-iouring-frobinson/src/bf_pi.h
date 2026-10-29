@@ -1,3 +1,5 @@
+// MIT License — fork of c-iouring-tigokraft (#10); ideas from c-iouring-gilnett (#58), rust-tokio-Scooter1337 (#7), csharp-sockets-jh-d (#22).
+// Original MIT code (c) challenge contributors; modifications (c) frobinson. See README Credits.
 // Blowfish's initial state: the fractional hex digits of pi (P-array first, then the four S-boxes).
 // Generated from golang.org/x/crypto/blowfish/const.go (v0.58.0); these are mathematical constants.
 #ifndef BF_PI_H

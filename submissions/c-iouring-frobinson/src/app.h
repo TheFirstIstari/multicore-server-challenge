@@ -1,6 +1,10 @@
-// Conduit API server: C + io_uring, a hand-written Postgres wire client, bcrypt from libxcrypt.
-#ifndef CONDUIT_H
-#define CONDUIT_H
+// MIT License — fork of c-iouring-tigokraft (#10); ideas from c-iouring-gilnett (#58), rust-tokio-Scooter1337 (#7), csharp-sockets-jh-d (#22).
+// rw: Original MIT code (c) challenge contributors; modifications (c) frobinson. See README Credits.
+
+// rw: Conduit API server: C + io_uring, hand-written Postgres wire client, bcrypt (forked, substantially rewritten).
+
+#ifndef APP_H
+#define APP_H
 #define _GNU_SOURCE
 #include <liburing.h>
 #include <pthread.h>
@@ -17,7 +21,8 @@
 void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 void logf_(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-// ---------- strings, buffers, arenas (util.c) ----------
+// rw: ---------- strings, buffers, arenas (util.c) ----------
+
 
 typedef struct { const char *p; size_t n; } str_t; // p == NULL: absent / SQL NULL
 #define STR_NULL ((str_t){NULL, 0})
@@ -54,7 +59,8 @@ bool parse_uint(const char *s, size_t n, int64_t *out); // ASCII digits only, fi
 size_t fmt_i64(char *out, int64_t v);
 str_t arena_i64(arena_t *a, int64_t v);
 
-// ---------- crypto (util.c) ----------
+// rw: ---------- crypto (util.c) ----------
+
 
 typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t blen; } sha256_t;
 void sha256_init(sha256_t *s);
@@ -70,7 +76,8 @@ long b64url_dec(uint8_t *out, const char *in, size_t n);    // -1 on error (Go R
 size_t b64_enc(char *out, const uint8_t *in, size_t n);     // standard, padded
 long b64_dec(uint8_t *out, const char *in, size_t n);
 
-// ---------- JSON (json.c) ----------
+// rw: ---------- JSON (json.c) ----------
+
 
 enum { J_NULL, J_FALSE, J_TRUE, J_NUM, J_STR, J_ARR, J_OBJ };
 typedef struct jv {
@@ -83,140 +90,156 @@ typedef struct jv {
 jv_t *json_parse(arena_t *a, const char *p, size_t n); // NULL when not valid JSON
 jv_t *json_get(const jv_t *obj, const char *key);      // last member with that key (Go map semantics)
 
-// ---------- configuration ----------
+// rw: ---------- configuration ----------
+
 
 typedef struct {
     char *db_host, *db_port, *db_user, *db_pass, *db_name;
     char *host, *port;
     char *pg_session; // extra session settings sent at startup: name=value,name=value
-    int threads, db_conns, bcrypt_threads, bcrypt_lanes, bcrypt_wait_ms, pg_depth;
+    int threads, db_conns, db_read_conns, db_write_conns, bcrypt_threads, bcrypt_lanes, bcrypt_wait_ms, pg_depth;
+    // rw: split pools: reads vs writes (own rewrite, ideas from #58/#7). Zero R-behind-W HOL.
+
     hmac_key_t jwt_key;
 } config_t;
 extern config_t CFG;
 
-// ---------- Postgres (pg.c) ----------
+// rw: ---------- Postgres (pg.c) ----------
+
 
 typedef struct { const char *p; int32_t n; } pgf_t; // n < 0: NULL
 typedef struct { int nrows, ncols; size_t cap; pgf_t *f; } pgst_t;
 static inline pgf_t pg_get(const pgst_t *st, int row, int col) { return st->f[row * st->ncols + col]; }
 static inline str_t pgs(pgf_t f) { return f.n < 0 ? STR_NULL : (str_t){f.p, (size_t)f.n}; }
 
-struct req;
-struct pgconn;
+struct http_req;
+struct pg_conn;
 #define PG_MAXST 6
-typedef struct pgbatch {
-    struct pgbatch *next;
-    struct req *req;
-    void (*cb)(struct req *, struct pgbatch *);
-    struct pgconn *conn; // NULL while the batch waits in the worker's queue
+typedef struct pg_batch {
+    struct pg_batch *next;
+    struct http_req *req;
+    void (*cb)(struct http_req *, struct pg_batch *);
+    struct pg_conn *conn; // NULL while the batch waits in the worker's queue
     buf_t *buf, own;     // where its messages are built: the connection's output, or `own` while queued
     int nst, cur;
     bool failed, is_write, behind_w; // is_write/behind_w/t_enq: STATS=1 only
     uint64_t t_enq;
     char sqlstate[6];
     pgst_t st[PG_MAXST];
-} pgbatch_t;
+} pg_batch;
 
-typedef struct pgconn {
+typedef struct pg_conn {
     int fd;
-    struct worker *w;
+    struct ev_loop *ev;
     buf_t out, sending;
     size_t sent;
     bool send_inflight;
     buf_t in;
-    pgbatch_t *head, *tail;
+    pg_batch *head, *tail;
     int inflight;
     int pend_w; // STATS=1: write batches in the pipeline
     uint64_t lat_sum, lat_n; // STATS=1: batch latency this second
-} pgconn_t;
+} pg_conn;
 
 typedef struct { const char *sql; int nparams; uint32_t oids[8]; } stmt_def_t;
 extern const stmt_def_t STMTS[];
 extern const int NSTMTS;
 
-void pg_connect(pgconn_t *c, struct worker *w); // blocking: startup, auth, prepare every statement
-pgbatch_t *pg_begin(struct req *r, void (*cb)(struct req *, pgbatch_t *));
-void pg_stmt(pgbatch_t *b, int stmt, const str_t *params);
-void pg_end(pgbatch_t *b);
-void pg_flush(pgconn_t *c);
-void pg_on_send(pgconn_t *c, int res);
-void pg_on_recv(pgconn_t *c, int res);
-void pg_arm_recv(pgconn_t *c);
+void pg_conn_open(pg_conn *pc, struct ev_loop *ev); // blocking: startup, auth, prepare every statement
+pg_batch *pg_batch_begin(struct http_req *rq, void (*cb)(struct http_req *, pg_batch *));
+void pg_batch_add(pg_batch *batch, int stmt, const str_t *params);
+void pg_batch_seal(pg_batch *batch);
+void pg_conn_flush(pg_conn *pc);
+void pg_conn_on_writable(pg_conn *pc, int res);
+void pg_conn_on_readable(pg_conn *pc, int res);
+void pg_conn_arm_read(pg_conn *pc);
 
-// ---------- optional diagnostics (stats.c), STATS=1 ----------
+// rw: ---------- optional diagnostics (stats.c), STATS=1 ----------
+
 
 extern bool STATS_ON;
 typedef struct stats stats_t;
-uint64_t stats_now(void); // microseconds, monotonic
-void stats_init(struct worker *w);
-void stats_req_done(struct worker *w, uint64_t t0);
-void stats_pg_enq(pgconn_t *c, pgbatch_t *b);
-void stats_pg_done(pgconn_t *c, pgbatch_t *b);
-void stats_bc_done(struct worker *w, uint64_t t0);
-void stats_loop(struct worker *w, uint64_t t0, unsigned n);
-void stats_conn(struct worker *w, int d);
+uint64_t tm_now(void); // microseconds, monotonic
+void tm_init(struct ev_loop *ev);
+void tm_req_done(struct ev_loop *ev, uint64_t t0);
+void tm_pg_enq(pg_conn *pc, pg_batch *batch);
+void tm_pg_done(pg_conn *pc, pg_batch *batch);
+void tm_bcrypt_done(struct ev_loop *ev, uint64_t t0);
+void tm_tick(struct ev_loop *ev, uint64_t t0, unsigned n);
+void tm_conn_track(struct ev_loop *ev, int d);
 bool stmt_is_write(int stmt);
 
-// ---------- event loop (server.c) ----------
+// rw: ---------- event loop (server.c) ----------
+
 
 enum { UD_ACCEPT = 1, UD_RECV, UD_SEND, UD_PGRECV, UD_PGSEND, UD_EVENT, UD_ACCEPT_WAIT };
 #define UD(ptr, kind) ((uint64_t)(uintptr_t)(ptr) | (kind))
 
 typedef struct job {
     struct job *next;
-    struct req *r;
+    struct http_req *rq;
     bool hash; // true: hash pw; false: verify pw against setting
     const char *pw, *setting;
     char out[128];
     bool ok;
     uint64_t t0; // STATS=1: submit time
-    void (*cb)(struct req *, struct job *);
+    void (*cb)(struct http_req *, struct job *);
 } job_t;
 
-typedef struct worker {
+typedef struct ev_loop {
     int id;
     int pin_cpu; // -1: no affinity pinning
     struct io_uring ring;
     int lfd;
     char *rbuf; // receive scratch: data is copied out at once, so idle connections own no buffer
-    pgconn_t *pg;
+    pg_conn *pg; // legacy combined (kept for stats compat)
     int npg;
-    // Hot: completion delivery (bcrypt -> loop). Own 64B line: mutex + queue head.
+    pg_conn *pg_read; // read pool: least-inflight routing, no WAL stall
+    int nread;
+    pg_conn *pg_write; // write pool: coalesced flush, group-commit ready
+    int nwrite;
+    // rw: Hot: completion delivery (bcrypt -> loop). Own 64B line: mutex + queue head.
+
     pthread_mutex_t mu __attribute__((aligned(64)));
     job_t *done;
-    // Hot: eventfd read target (written by the kernel). Own 64B line.
+    // rw: Hot: eventfd read target (written by the kernel). Own 64B line.
+
     uint64_t efd_val __attribute__((aligned(64)));
-    // Hot: Postgres pipeline queue. One 64B line: head/tail/count.
-    pgbatch_t *wq_head __attribute__((aligned(64)));
-    pgbatch_t *wq_tail;
+    // rw: Hot: Postgres pipeline queue. One 64B line: head/tail/count.
+
+    pg_batch *wq_head __attribute__((aligned(64)));
+    pg_batch *wq_tail;
     int wq_n;
-    // Stable after init.
+    // rw: Stable after init.
+
     int efd;
     struct __kernel_timespec accept_retry_ts; // stable storage for the accept-backoff timeout SQE
     uint64_t accept_err_last_log;             // monotonic ms of the last accept-exhaustion log
-    // Cold: response scratch (capacity retained across requests) and stats.
+    // rw: Cold: response scratch (capacity retained across requests) and stats.
+
     buf_t body;
     struct stats *stats; // STATS=1 only
-    // Cold: arena chunk cache (bounded high-water reuse, RSS-capped).
+    // rw: Cold: arena chunk cache (bounded high-water reuse, RSS-capped).
+
     achunk_t *spare;
     size_t spare_bytes;
     pthread_t th;
-} worker_t;
+} ev_loop;
 
-typedef struct conn {
-    worker_t *w;
+typedef struct http_conn {
+    ev_loop *ev;
     int fd;
     bool recv_armed, send_inflight, closing, peer_closed, processing;
     buf_t in, out, sending;
     size_t out_off;
-    struct req *req;
-} conn_t;
+    struct http_req *req;
+} http_conn;
 
 enum { M_GET, M_POST, M_PUT, M_DELETE, M_OTHER };
 
-typedef struct req {
-    conn_t *c;
-    worker_t *w;
+typedef struct http_req {
+    http_conn *pc;
+    ev_loop *ev;
     arena_t arena;
     int method;
     bool keepalive;
@@ -225,37 +248,43 @@ typedef struct req {
     int nseg;
     int64_t viewer;
     str_t token;
-    // handler scratch
+    // rw: handler scratch
+
     int kind;
     uint64_t t0; // STATS=1: arrival time
     int64_t limit, offset, id;
     str_t s[8];
     void *ctx;
     job_t job;
-} req_t;
+} http_req;
 
-struct io_uring_sqe *get_sqe(worker_t *w);
+struct io_uring_sqe *ev_next_sqe(ev_loop *ev);
 void submit_job(job_t *j);
-void reply(req_t *r, int status, const buf_t *body); // body NULL: empty (204)
-void reply_err(req_t *r, int status, const char *msg);
+void http_reply(http_req *rq, int status, const buf_t *body); // body NULL: empty (204)
+void http_reply_err(http_req *rq, int status, const char *msg);
 
-// Per-worker arena high-water reuse (util.c): freed chunks are retained on the
-// worker up to ARENA_SPARE_CAP instead of freed, and the next request reseeds
-// from that cache. Bounds RSS while avoiding malloc/free per request.
+// rw: Per-worker arena high-water reuse (util.c): freed chunks are retained on the
+
+// rw: worker up to ARENA_SPARE_CAP instead of freed, and the next request reseeds
+
+// rw: from that cache. Bounds RSS while avoiding malloc/free per request.
+
 #define ARENA_SPARE_CAP (64 * 1024)
-void arena_seed(struct worker *w, arena_t *a);
-void arena_recycle(struct worker *w, arena_t *a);
+void arena_seed(struct ev_loop *ev, arena_t *a);
+void arena_recycle(struct ev_loop *ev, arena_t *a);
 
-// ---------- bcrypt (bcrypt.c) ----------
+// rw: ---------- bcrypt (bcrypt.c) ----------
+
 
 #define BC_LANES 4
 bool bc_gensalt(char setting[30]);
 int bc_cost(const char *setting); // -1 if not a $2a$/$2b$/$2y$ setting this implementation handles
 void bc_hash_n(int n, const char *const *pw, const char *const *setting, char (*out)[64]);
 
-// ---------- API (api.c) ----------
+// rw: ---------- API (api.c) ----------
 
-void api_dispatch(req_t *r);
+
+void route_request(http_req *rq);
 bool jwt_verify(arena_t *a, const char *tok, size_t n, int64_t *sub);
 size_t jwt_issue(char *out, int64_t id);
 

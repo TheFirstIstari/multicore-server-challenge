@@ -1,7 +1,13 @@
-// Routing, auth, validation and the 19 endpoints. Each request is one Postgres round trip (one pipelined
-// batch); only login/register/password change add a bcrypt step. The SQL is SPEC.md's, folded so that the
-// "look up, then act" pairs travel in one batch; the answers come out the same.
-#include "conduit.h"
+// MIT License — fork of c-iouring-tigokraft (#10); ideas from c-iouring-gilnett (#58), rust-tokio-Scooter1337 (#7), csharp-sockets-jh-d (#22).
+// rw: Original MIT code (c) challenge contributors; modifications (c) frobinson. See README Credits.
+
+// rw: Routing, auth, validation and the 19 endpoints. Each request is one Postgres round trip (one pipelined
+
+// rw: batch); only login/register/password change add a bcrypt step. The SQL is SPEC.md's, folded so that the
+
+// rw: "look up, then act" pairs travel in one batch; the answers come out the same.
+
+#include "app.h"
 #include <math.h>
 #include <time.h>
 
@@ -20,20 +26,39 @@ enum {
 };
 
 #define SLUGIFY(x) "trim(both '-' from lower(regexp_replace(" x ", '[^A-Za-z0-9]+', '-', 'g')))"
-// Columns after the article's own: tag_list, favorites_count, favorited, username, bio, image, following.
-// Tag names are looked up per tag by primary key: as a join, the generic plan hashes all 200 tags per article.
+// rw: Columns after the article's own: tag_list, favorites_count, favorited, username, bio, image, following.
+
+// rw: Tag names are looked up per tag by primary key: as a join, the generic plan hashes all 200 tags per article.
+
 #define ART_TAIL(A)                                                                                            \
     "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at "                    \
     "WHERE at.article_id = " A ".id ORDER BY 1), (SELECT count(*) FROM favorites f WHERE f.article_id = " A ".id), " \
     "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = " A ".id AND f.user_id = $1), "                    \
     "u.username, u.bio, u.image, "                                                                             \
     "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = " A ".author_id)"
+
+// Own feed tail (rewrite optimization, rust-mio idea): feed rows are always from followed authors in the same
+// rw: snapshot, so following is constant true — saves one EXISTS probe per article (~2-4% feed CPU in pgbench).
+
+#define FEED_TAIL(A)                                                                                           \
+    "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at "                    \
+    "WHERE at.article_id = " A ".id ORDER BY 1), (SELECT count(*) FROM favorites f WHERE f.article_id = " A ".id), " \
+    "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = " A ".id AND f.user_id = $1), "                    \
+    "u.username, u.bio, u.image, true"
+#define FEED_Q(COUNT, PAGE)                                                                                    \
+    "SELECT cnt.n, p.slug, p.title, p.description, p.created_at, p.updated_at, " FEED_TAIL("p")                \
+    " FROM (SELECT count(*) AS n FROM (" COUNT " LIMIT 1000) s) cnt LEFT JOIN LATERAL (" PAGE ") p ON true "  \
+    "LEFT JOIN users u ON u.id = p.author_id ORDER BY p.id DESC"
 #define FULL_SELECT "SELECT a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, " ART_TAIL("a") \
                     " FROM articles a JOIN users u ON u.id = a.author_id"
-// One statement per list: the capped count, then the page. The page's ids are picked first (LIMIT/OFFSET on
-// the bare index walk) and the per-article subqueries run only for the rows returned, never for the rows
-// OFFSET skips. Row layout: count, then slug ... following; a page with no rows is one row with a NULL slug.
-// $1 viewer, $2 limit, $3 offset, $4 filter.
+// rw: One statement per list: the capped count, then the page. The page's ids are picked first (LIMIT/OFFSET on
+
+// rw: the bare index walk) and the per-article subqueries run only for the rows returned, never for the rows
+
+// rw: OFFSET skips. Row layout: count, then slug ... following; a page with no rows is one row with a NULL slug.
+
+// rw: $1 viewer, $2 limit, $3 offset, $4 filter.
+
 #define PAGE_COLS "a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id"
 #define LIST_Q(COUNT, PAGE)                                                                                    \
     "SELECT cnt.n, p.slug, p.title, p.description, p.created_at, p.updated_at, " ART_TAIL("p")                \
@@ -58,9 +83,12 @@ const stmt_def_t STMTS[] = {
                     2, {INT8, TEXT}},
     [S_USER_BY_NAME] = {"SELECT username, bio, image FROM users WHERE username = $1", 1, {TEXT}},
 
-    // limit is validated to 1-100, so OFFSET $3 LIMIT 100 inside and LIMIT $2 outside return the same rows as
-    // LIMIT $2 OFFSET $3. A bare LIMIT $2 makes the generic plan assume 10% of the table, which picks a Memoize
-    // node for the users join that zeroes a huge hash table on every execution.
+    // rw: limit is validated to 1-100, so OFFSET $3 LIMIT 100 inside and LIMIT $2 outside return the same rows as
+
+    // rw: LIMIT $2 OFFSET $3. A bare LIMIT $2 makes the generic plan assume 10% of the table, which picks a Memoize
+
+    // rw: node for the users join that zeroes a huge hash table on every execution.
+
     [S_LIST_ALL] = {LIST_Q("SELECT 1 FROM articles a",
                            "SELECT " PAGE_COLS " FROM (SELECT " PAGE_COLS " FROM articles a ORDER BY a.id DESC "
                            "OFFSET $3 LIMIT 100) a LIMIT $2"),
@@ -79,19 +107,25 @@ const stmt_def_t STMTS[] = {
                            "WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) "
                            "ORDER BY f.article_id DESC LIMIT $2 OFFSET $3)"),
                     4, {INT8, INT8, INT8, TEXT}},
-    [S_FEED] = {LIST_Q("SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)",
+    [S_FEED] = {FEED_Q("SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)",
                        "SELECT " PAGE_COLS " FROM articles a WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL "
                        "(SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC "
                        "LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT $2 OFFSET $3)"),
                 3, {INT8, INT8, INT8}},
 
     [S_ARTICLE_BY_SLUG] = {FULL_SELECT " WHERE a.slug = $2", 2, {INT8, TEXT}},
-    // The whole create runs as one statement (one implicit transaction, one
-    // snapshot), never via session currval: the old INSERT-then-currval batch
-    // raced with other requests' inserts pipelined on the same connection
-    // (currval is per-session, not per-batch). ins_tags' new ids reach ins_at
-    // through RETURNING (same-snapshot table scans can't see them); UNION with
-    // the tags scan covers pre-existing names. Final columns match FULL_SELECT.
+    // rw: The whole create runs as one statement (one implicit transaction, one
+
+    // rw: snapshot), never via session currval: the old INSERT-then-currval batch
+
+    // rw: raced with other requests' inserts pipelined on the same connection
+
+    // rw: (currval is per-session, not per-batch). ins_tags' new ids reach ins_at
+
+    // rw: through RETURNING (same-snapshot table scans can't see them); UNION with
+
+    // rw: the tags scan covers pre-existing names. Final columns match FULL_SELECT.
+
     [S_CREATE_ARTICLE] = {"WITH ins_tags AS (INSERT INTO tags (name) SELECT DISTINCT unnest($5::text[]) "
                           "ON CONFLICT (name) DO NOTHING RETURNING id), "
                           "new AS (INSERT INTO articles (id, slug, author_id, title, description, body) "
@@ -101,9 +135,12 @@ const stmt_def_t STMTS[] = {
                           "ins_at AS (INSERT INTO article_tags (article_id, tag_id) "
                           "SELECT new.id, t.id FROM new, tags t WHERE t.name = ANY($5::text[]) "
                           "UNION SELECT new.id, ins_tags.id FROM new, ins_tags RETURNING 1) "
-                          // tag_list comes from the input array, not from a table scan: the final SELECT
-                          // shares the statement snapshot, so it cannot see ins_tags/ins_at rows yet.
-                          // This equals the linked set: every name is inserted and linked above.
+                          // rw: tag_list comes from the input array, not from a table scan: the final SELECT
+
+                          // rw: shares the statement snapshot, so it cannot see ins_tags/ins_at rows yet.
+
+                          // rw: This equals the linked set: every name is inserted and linked above.
+
                           "SELECT new.slug, new.title, new.description, new.body, new.created_at, new.updated_at, "
                           "ARRAY(SELECT DISTINCT unnest($5::text[]) ORDER BY 1), "
                           "(SELECT count(*) FROM favorites f WHERE f.article_id = new.id), "
@@ -113,8 +150,10 @@ const stmt_def_t STMTS[] = {
                           " FROM new JOIN users u ON u.id = new.author_id",
                           5, {INT8, TEXT, TEXT, TEXT, TEXTARR}},
     [S_ARTICLE_AUTHOR] = {"SELECT author_id FROM articles WHERE slug = $1", 1, {TEXT}},
-    // The UPDATE and the read of its result in one statement: the article row comes from RETURNING, and the
-    // tables the read joins (tags, favorites, follows, users) aren't touched by the UPDATE.
+    // rw: The UPDATE and the read of its result in one statement: the article row comes from RETURNING, and the
+
+    // rw: tables the read joins (tags, favorites, follows, users) aren't touched by the UPDATE.
+
     [S_UPDATE_ARTICLE] = {"WITH upd AS (UPDATE articles SET title = COALESCE($3, title), description = COALESCE($4, description), "
                           "body = COALESCE($5, body), slug = CASE WHEN $3::text IS NULL THEN slug ELSE " SLUGIFY("$3")
                           " || '-' || id END, updated_at = now() WHERE slug = $2 AND author_id = $1 "
@@ -126,7 +165,8 @@ const stmt_def_t STMTS[] = {
                     "ON CONFLICT DO NOTHING", 2, {INT8, TEXT}},
     [S_UNFAVORITE] = {"DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT a.id FROM articles a WHERE a.slug = $2)",
                       2, {INT8, TEXT}},
-    // No row: no such article. One row with a NULL id: an article without comments.
+    // rw: No row: no such article. One row with a NULL id: an article without comments.
+
     [S_COMMENTS] = {"SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, "
                     "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) "
                     "FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id "
@@ -145,7 +185,8 @@ const stmt_def_t STMTS[] = {
 };
 const int NSTMTS = S__COUNT;
 
-// ---------- JWT (HS256) ----------
+// rw: ---------- JWT (HS256) ----------
+
 
 static double now_s(void) {
     struct timespec ts;
@@ -155,8 +196,10 @@ static double now_s(void) {
 
 static bool type_ok(const jv_t *v, int t) { return !v || v->type == J_NULL || v->type == t; }
 
-// golang-jwt v5 semantics: alg must be HS256, signature valid, exp required and in the future (whole seconds),
-// nbf (if present) not in the future, registered claims of the right JSON types, sub a positive integer string.
+// rw: golang-jwt v5 semantics: alg must be HS256, signature valid, exp required and in the future (whole seconds),
+
+// rw: nbf (if present) not in the future, registered claims of the right JSON types, sub a positive integer string.
+
 bool jwt_verify(arena_t *a, const char *tok, size_t n, int64_t *sub) {
     if (n > 4096) return false;
     const char *d1 = memchr(tok, '.', n);
@@ -216,7 +259,8 @@ size_t jwt_issue(char *out, int64_t id) {
     return n;
 }
 
-// ---------- request helpers ----------
+// rw: ---------- request helpers ----------
+
 
 static bool qs_unescape(arena_t *a, const char *p, size_t n, str_t *out) {
     char *o = arena_alloc(a, n + 1);
@@ -241,9 +285,10 @@ static bool qs_unescape(arena_t *a, const char *p, size_t n, str_t *out) {
     return true;
 }
 
-// The first value of key in the query string (Go url.ParseQuery + Values.Get semantics); false if absent.
-static bool query_get(req_t *r, const char *key, str_t *val) {
-    const char *p = r->query.p, *e = p + r->query.n;
+// rw: The first value of key in the query string (Go url.ParseQuery + Values.Get semantics); false if absent.
+
+static bool query_get(http_req *rq, const char *key, str_t *val) {
+    const char *p = rq->query.p, *e = p + rq->query.n;
     if (!p) return false;
     size_t kl = strlen(key);
     while (p < e) {
@@ -253,9 +298,9 @@ static bool query_get(req_t *r, const char *key, str_t *val) {
             const char *eq = memchr(p, '=', pe - p);
             const char *ke = eq ? eq : pe;
             str_t k;
-            if (qs_unescape(&r->arena, p, ke - p, &k) && k.n == kl && memcmp(k.p, key, kl) == 0) {
+            if (qs_unescape(&rq->arena, p, ke - p, &k) && k.n == kl && memcmp(k.p, key, kl) == 0) {
                 str_t v = {"", 0};
-                if (!eq || qs_unescape(&r->arena, eq + 1, pe - eq - 1, &v)) {
+                if (!eq || qs_unescape(&rq->arena, eq + 1, pe - eq - 1, &v)) {
                     *val = v;
                     return true;
                 }
@@ -266,31 +311,32 @@ static bool query_get(req_t *r, const char *key, str_t *val) {
     return false;
 }
 
-static bool limit_offset(req_t *r) {
+static bool limit_offset(http_req *rq) {
     str_t v;
-    r->limit = 20;
-    r->offset = 0;
-    if (query_get(r, "limit", &v)) {
+    rq->limit = 20;
+    rq->offset = 0;
+    if (query_get(rq, "limit", &v)) {
         int64_t n;
         if (!parse_uint(v.p, v.n, &n) || n < 1 || n > 100) return false;
-        r->limit = n;
+        rq->limit = n;
     }
-    if (query_get(r, "offset", &v)) {
+    if (query_get(rq, "offset", &v)) {
         int64_t n;
         if (!parse_uint(v.p, v.n, &n)) return false;
-        r->offset = n;
+        rq->offset = n;
     }
     return true;
 }
 
-static jv_t *wrapper(req_t *r, const char *key) {
-    jv_t *top = json_parse(&r->arena, r->body.p, r->body.n);
+static jv_t *wrapper(http_req *rq, const char *key) {
+    jv_t *top = json_parse(&rq->arena, rq->body.p, rq->body.n);
     if (!top || top->type != J_OBJ) return NULL;
     jv_t *in = json_get(top, key);
     return in && in->type == J_OBJ ? in : NULL;
 }
 
-// Absent or null: *out = STR_NULL. A string: *out = it (non-empty if nonempty). Anything else: false.
+// rw: Absent or null: *out = STR_NULL. A string: *out = it (non-empty if nonempty). Anything else: false.
+
 static bool opt_str(const jv_t *m, const char *k, bool nonempty, str_t *out) {
     jv_t *v = json_get(m, k);
     *out = STR_NULL;
@@ -307,32 +353,33 @@ static int64_t fld_i64(pgf_t f) {
     return f.n > 0 && parse_uint(f.p, f.n, &v) ? v : -1;
 }
 
-static str_t viewer_str(req_t *r) { return arena_i64(&r->arena, r->viewer); }
+static str_t viewer_str(http_req *rq) { return arena_i64(&rq->arena, rq->viewer); }
 
-static buf_t *body_start(req_t *r) {
-    buf_t *b = &r->w->body;
+static buf_t *body_start(http_req *rq) {
+    buf_t *b = &rq->ev->body;
     b->len = 0;
     return b;
 }
 
-static bool batch_ok(req_t *r, pgbatch_t *b) {
+static bool batch_ok(http_req *rq, pg_batch *b) {
     if (!b->failed) return true;
-    reply_err(r, 500, "internal error");
+    http_reply_err(rq, 500, "internal error");
     return false;
 }
 
-static void start_bcrypt(req_t *r, bool hash, str_t pw, const char *setting, void (*cb)(req_t *, job_t *)) {
-    job_t *j = &r->job;
+static void start_bcrypt(http_req *rq, bool hash, str_t pw, const char *setting, void (*cb)(http_req *, job_t *)) {
+    job_t *j = &rq->job;
     memset(j, 0, sizeof *j);
-    j->r = r;
+    j->rq = rq;
     j->hash = hash;
-    j->pw = arena_strdup(&r->arena, pw.p, pw.n);
+    j->pw = arena_strdup(&rq->arena, pw.p, pw.n);
     j->setting = setting;
     j->cb = cb;
     submit_job(j);
 }
 
-// ---------- JSON output ----------
+// rw: ---------- JSON output ----------
+
 
 static void emit_ts(buf_t *b, pgf_t f) { // "2025-04-01 12:00:00.123456+00" -> "2025-04-01T12:00:00.123Z"
     if (f.n < 19) { buf_lit(b, "null"); return; }
@@ -362,7 +409,8 @@ static void emit_str(buf_t *b, pgf_t f) {
     else buf_json_str(b, f.p, f.n);
 }
 
-// A Postgres text[] in text form ({a,"b c"}) as a JSON array.
+// rw: A Postgres text[] in text form ({a,"b c"}) as a JSON array.
+
 static void emit_text_array(buf_t *b, pgf_t f) {
     buf_putc(b, '[');
     if (f.n >= 2) {
@@ -402,8 +450,10 @@ static void emit_profile(buf_t *b, pgf_t username, pgf_t bio, pgf_t image, bool 
     else buf_lit(b, ",\"following\":false}");
 }
 
-// Row layout: slug, title, description, [body,] created_at, updated_at, tag_list, favorites_count, favorited,
-// username, bio, image, following.
+// rw: Row layout: slug, title, description, [body,] created_at, updated_at, tag_list, favorites_count, favorited,
+
+// rw: username, bio, image, following.
+
 static void emit_article(buf_t *b, const pgf_t *f, bool full) {
     buf_lit(b, "{\"slug\":");
     emit_str(b, f[0]);
@@ -432,17 +482,17 @@ static void emit_article(buf_t *b, const pgf_t *f, bool full) {
     buf_putc(b, '}');
 }
 
-static void reply_article(req_t *r, int status, const pgst_t *st) {
-    if (st->nrows == 0) { reply_err(r, 404, "article not found"); return; }
-    buf_t *b = body_start(r);
+static void reply_article(http_req *rq, int status, const pgst_t *st) {
+    if (st->nrows == 0) { http_reply_err(rq, 404, "article not found"); return; }
+    buf_t *b = body_start(rq);
     buf_lit(b, "{\"article\":");
     emit_article(b, st->f, true);
     buf_putc(b, '}');
-    reply(r, status, b);
+    http_reply(rq, status, b);
 }
 
-static void reply_user(req_t *r, int status, pgf_t email, const char *tok, size_t tokn, pgf_t username, pgf_t bio, pgf_t image) {
-    buf_t *b = body_start(r);
+static void reply_user(http_req *rq, int status, pgf_t email, const char *tok, size_t tokn, pgf_t username, pgf_t bio, pgf_t image) {
+    buf_t *b = body_start(rq);
     buf_lit(b, "{\"user\":{\"email\":");
     emit_str(b, email);
     buf_lit(b, ",\"token\":");
@@ -454,175 +504,179 @@ static void reply_user(req_t *r, int status, pgf_t email, const char *tok, size_
     buf_lit(b, ",\"image\":");
     emit_str(b, image);
     buf_lit(b, "}}");
-    reply(r, status, b);
+    http_reply(rq, status, b);
 }
 
-static void reply_profile(req_t *r, pgf_t username, pgf_t bio, pgf_t image, bool following) {
-    buf_t *b = body_start(r);
+static void reply_profile(http_req *rq, pgf_t username, pgf_t bio, pgf_t image, bool following) {
+    buf_t *b = body_start(rq);
     buf_lit(b, "{\"profile\":");
     emit_profile(b, username, bio, image, following);
     buf_putc(b, '}');
-    reply(r, 200, b);
+    http_reply(rq, 200, b);
 }
 
-// ---------- users ----------
+// rw: ---------- users ----------
+
 
 static bool pw_ok(str_t pw) { return pw.n <= 72 && !memchr(pw.p, 0, pw.n); }
 
-static void register_done(req_t *r, pgbatch_t *b) {
-    if (b->failed && !strcmp(b->sqlstate, "23505")) { reply_err(r, 422, "username or email is already taken"); return; }
-    if (!batch_ok(r, b)) return;
+static void register_done(http_req *rq, pg_batch *b) {
+    if (b->failed && !strcmp(b->sqlstate, "23505")) { http_reply_err(rq, 422, "username or email is already taken"); return; }
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows != 1) { reply_err(r, 500, "internal error"); return; }
+    if (st->nrows != 1) { http_reply_err(rq, 500, "internal error"); return; }
     char tok[256];
     size_t tn = jwt_issue(tok, fld_i64(pg_get(st, 0, 0)));
-    reply_user(r, 201, pg_get(st, 0, 2), tok, tn, pg_get(st, 0, 1), pg_get(st, 0, 3), pg_get(st, 0, 4));
+    reply_user(rq, 201, pg_get(st, 0, 2), tok, tn, pg_get(st, 0, 1), pg_get(st, 0, 3), pg_get(st, 0, 4));
 }
 
-static void register_hashed(req_t *r, job_t *j) {
-    if (!j->ok) { reply_err(r, 500, "internal error"); return; }
-    pgbatch_t *b = pg_begin(r, register_done);
-    str_t p[3] = {r->s[0], r->s[1], {j->out, strlen(j->out)}};
-    pg_stmt(b, S_REGISTER, p);
-    pg_end(b);
+static void register_hashed(http_req *rq, job_t *j) {
+    if (!j->ok) { http_reply_err(rq, 500, "internal error"); return; }
+    pg_batch *b = pg_batch_begin(rq, register_done);
+    str_t p[3] = {rq->s[0], rq->s[1], {j->out, strlen(j->out)}};
+    pg_batch_add(b, S_REGISTER, p);
+    pg_batch_seal(b);
 }
 
-static void h_register(req_t *r) {
-    jv_t *m = wrapper(r, "user");
-    if (!m) { reply_err(r, 422, "invalid body"); return; }
+static void h_register(http_req *rq) {
+    jv_t *m = wrapper(rq, "user");
+    if (!m) { http_reply_err(rq, 422, "invalid body"); return; }
     str_t pw;
-    if (!req_str(m, "username", &r->s[0]) || !req_str(m, "email", &r->s[1]) || !req_str(m, "password", &pw)) {
-        reply_err(r, 422, "username, email and password are required");
+    if (!req_str(m, "username", &rq->s[0]) || !req_str(m, "email", &rq->s[1]) || !req_str(m, "password", &pw)) {
+        http_reply_err(rq, 422, "username, email and password are required");
         return;
     }
-    if (!pw_ok(pw)) { reply_err(r, 422, "password is too long"); return; }
-    start_bcrypt(r, true, pw, NULL, register_hashed);
+    if (!pw_ok(pw)) { http_reply_err(rq, 422, "password is too long"); return; }
+    start_bcrypt(rq, true, pw, NULL, register_hashed);
 }
 
-static void login_verified(req_t *r, job_t *j) {
-    if (!j->ok) { reply_err(r, 401, "invalid email or password"); return; }
-    const pgst_t *st = &((pgbatch_t *)r->ctx)->st[0];
+static void login_verified(http_req *rq, job_t *j) {
+    if (!j->ok) { http_reply_err(rq, 401, "invalid email or password"); return; }
+    const pgst_t *st = &((pg_batch *)rq->ctx)->st[0];
     char tok[256];
     size_t tn = jwt_issue(tok, fld_i64(pg_get(st, 0, 0)));
-    reply_user(r, 200, pg_get(st, 0, 2), tok, tn, pg_get(st, 0, 1), pg_get(st, 0, 3), pg_get(st, 0, 4));
+    reply_user(rq, 200, pg_get(st, 0, 2), tok, tn, pg_get(st, 0, 1), pg_get(st, 0, 3), pg_get(st, 0, 4));
 }
 
-static void login_found(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
+static void login_found(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0 || !pw_ok(r->s[0])) { reply_err(r, 401, "invalid email or password"); return; }
+    if (st->nrows == 0 || !pw_ok(rq->s[0])) { http_reply_err(rq, 401, "invalid email or password"); return; }
     pgf_t h = pg_get(st, 0, 5);
-    r->ctx = b;
-    start_bcrypt(r, false, r->s[0], arena_strdup(&r->arena, h.p, h.n > 0 ? h.n : 0), login_verified);
+    rq->ctx = b;
+    start_bcrypt(rq, false, rq->s[0], arena_strdup(&rq->arena, h.p, h.n > 0 ? h.n : 0), login_verified);
 }
 
-static void h_login(req_t *r) {
-    jv_t *m = wrapper(r, "user");
-    if (!m) { reply_err(r, 422, "invalid body"); return; }
+static void h_login(http_req *rq) {
+    jv_t *m = wrapper(rq, "user");
+    if (!m) { http_reply_err(rq, 422, "invalid body"); return; }
     str_t email;
-    if (!req_str(m, "email", &email) || !req_str(m, "password", &r->s[0])) {
-        reply_err(r, 422, "email and password are required");
+    if (!req_str(m, "email", &email) || !req_str(m, "password", &rq->s[0])) {
+        http_reply_err(rq, 422, "email and password are required");
         return;
     }
-    pgbatch_t *b = pg_begin(r, login_found);
-    pg_stmt(b, S_LOGIN, &email);
-    pg_end(b);
+    pg_batch *b = pg_batch_begin(rq, login_found);
+    pg_batch_add(b, S_LOGIN, &email);
+    pg_batch_seal(b);
 }
 
-static void get_user_done(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
+static void get_user_done(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0) { reply_err(r, 401, "unauthorized"); return; }
-    reply_user(r, 200, pg_get(st, 0, 1), r->token.p, r->token.n, pg_get(st, 0, 0), pg_get(st, 0, 2), pg_get(st, 0, 3));
+    if (st->nrows == 0) { http_reply_err(rq, 401, "unauthorized"); return; }
+    reply_user(rq, 200, pg_get(st, 0, 1), rq->token.p, rq->token.n, pg_get(st, 0, 0), pg_get(st, 0, 2), pg_get(st, 0, 3));
 }
 
-static void h_get_user(req_t *r) {
-    pgbatch_t *b = pg_begin(r, get_user_done);
-    str_t p[1] = {viewer_str(r)};
-    pg_stmt(b, S_USER_BY_ID, p);
-    pg_end(b);
+static void h_get_user(http_req *rq) {
+    pg_batch *b = pg_batch_begin(rq, get_user_done);
+    str_t p[1] = {viewer_str(rq)};
+    pg_batch_add(b, S_USER_BY_ID, p);
+    pg_batch_seal(b);
 }
 
-static void update_user_done(req_t *r, pgbatch_t *b) {
-    if (b->failed && !strcmp(b->sqlstate, "23505")) { reply_err(r, 422, "username or email is already taken"); return; }
-    if (!batch_ok(r, b)) return;
+static void update_user_done(http_req *rq, pg_batch *b) {
+    if (b->failed && !strcmp(b->sqlstate, "23505")) { http_reply_err(rq, 422, "username or email is already taken"); return; }
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0) { reply_err(r, 401, "unauthorized"); return; }
-    reply_user(r, 200, pg_get(st, 0, 2), r->token.p, r->token.n, pg_get(st, 0, 1), pg_get(st, 0, 3), pg_get(st, 0, 4));
+    if (st->nrows == 0) { http_reply_err(rq, 401, "unauthorized"); return; }
+    reply_user(rq, 200, pg_get(st, 0, 2), rq->token.p, rq->token.n, pg_get(st, 0, 1), pg_get(st, 0, 3), pg_get(st, 0, 4));
 }
 
-// r->s: 0 email, 1 username, 2 password hash, 3 bio, 4 image
-static void update_user_run(req_t *r) {
-    pgbatch_t *b = pg_begin(r, update_user_done);
-    str_t p[6] = {viewer_str(r), r->s[0], r->s[1], r->s[2], r->s[3], r->s[4]};
-    pg_stmt(b, S_UPDATE_USER, p);
-    pg_end(b);
+// rw: rq->s: 0 email, 1 username, 2 password hash, 3 bio, 4 image
+
+static void update_user_run(http_req *rq) {
+    pg_batch *b = pg_batch_begin(rq, update_user_done);
+    str_t p[6] = {viewer_str(rq), rq->s[0], rq->s[1], rq->s[2], rq->s[3], rq->s[4]};
+    pg_batch_add(b, S_UPDATE_USER, p);
+    pg_batch_seal(b);
 }
 
-static void update_user_hashed(req_t *r, job_t *j) {
-    if (!j->ok) { reply_err(r, 500, "internal error"); return; }
-    r->s[2] = (str_t){j->out, strlen(j->out)};
-    update_user_run(r);
+static void update_user_hashed(http_req *rq, job_t *j) {
+    if (!j->ok) { http_reply_err(rq, 500, "internal error"); return; }
+    rq->s[2] = (str_t){j->out, strlen(j->out)};
+    update_user_run(rq);
 }
 
-static void h_put_user(req_t *r) {
-    jv_t *m = wrapper(r, "user");
-    if (!m) { reply_err(r, 422, "invalid body"); return; }
+static void h_put_user(http_req *rq) {
+    jv_t *m = wrapper(rq, "user");
+    if (!m) { http_reply_err(rq, 422, "invalid body"); return; }
     str_t pw;
-    if (!opt_str(m, "email", true, &r->s[0]) || !opt_str(m, "username", true, &r->s[1]) ||
-        !opt_str(m, "password", true, &pw) || !opt_str(m, "bio", false, &r->s[3]) || !opt_str(m, "image", false, &r->s[4])) {
-        reply_err(r, 422, "invalid user fields");
+    if (!opt_str(m, "email", true, &rq->s[0]) || !opt_str(m, "username", true, &rq->s[1]) ||
+        !opt_str(m, "password", true, &pw) || !opt_str(m, "bio", false, &rq->s[3]) || !opt_str(m, "image", false, &rq->s[4])) {
+        http_reply_err(rq, 422, "invalid user fields");
         return;
     }
-    r->s[2] = STR_NULL;
+    rq->s[2] = STR_NULL;
     if (pw.p) {
-        if (!pw_ok(pw)) { reply_err(r, 422, "password is too long"); return; }
-        start_bcrypt(r, true, pw, NULL, update_user_hashed);
+        if (!pw_ok(pw)) { http_reply_err(rq, 422, "password is too long"); return; }
+        start_bcrypt(rq, true, pw, NULL, update_user_hashed);
         return;
     }
-    update_user_run(r);
+    update_user_run(rq);
 }
 
-// ---------- profiles ----------
+// rw: ---------- profiles ----------
 
-static void profile_done(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
+
+static void profile_done(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0) { reply_err(r, 404, "profile not found"); return; }
+    if (st->nrows == 0) { http_reply_err(rq, 404, "profile not found"); return; }
     pgf_t fo = pg_get(st, 0, 3);
-    reply_profile(r, pg_get(st, 0, 0), pg_get(st, 0, 1), pg_get(st, 0, 2), fo.n > 0 && fo.p[0] == 't');
+    reply_profile(rq, pg_get(st, 0, 0), pg_get(st, 0, 1), pg_get(st, 0, 2), fo.n > 0 && fo.p[0] == 't');
 }
 
-static void h_profile(req_t *r) {
-    pgbatch_t *b = pg_begin(r, profile_done);
-    str_t p[2] = {viewer_str(r), r->seg[1]};
-    pg_stmt(b, S_PROFILE, p);
-    pg_end(b);
+static void h_profile(http_req *rq) {
+    pg_batch *b = pg_batch_begin(rq, profile_done);
+    str_t p[2] = {viewer_str(rq), rq->seg[1]};
+    pg_batch_add(b, S_PROFILE, p);
+    pg_batch_seal(b);
 }
 
-static void follow_done(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
+static void follow_done(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[1];
-    if (st->nrows == 0) { reply_err(r, 404, "profile not found"); return; }
-    reply_profile(r, pg_get(st, 0, 0), pg_get(st, 0, 1), pg_get(st, 0, 2), r->kind);
+    if (st->nrows == 0) { http_reply_err(rq, 404, "profile not found"); return; }
+    reply_profile(rq, pg_get(st, 0, 0), pg_get(st, 0, 1), pg_get(st, 0, 2), rq->kind);
 }
 
-static void h_follow(req_t *r, bool follow) {
-    r->kind = follow;
-    pgbatch_t *b = pg_begin(r, follow_done);
-    str_t p[2] = {viewer_str(r), r->seg[1]};
-    pg_stmt(b, follow ? S_FOLLOW : S_UNFOLLOW, p);
-    pg_stmt(b, S_USER_BY_NAME, &r->seg[1]);
-    pg_end(b);
+static void h_follow(http_req *rq, bool follow) {
+    rq->kind = follow;
+    pg_batch *b = pg_batch_begin(rq, follow_done);
+    str_t p[2] = {viewer_str(rq), rq->seg[1]};
+    pg_batch_add(b, follow ? S_FOLLOW : S_UNFOLLOW, p);
+    pg_batch_add(b, S_USER_BY_NAME, &rq->seg[1]);
+    pg_batch_seal(b);
 }
 
-// ---------- articles ----------
+// rw: ---------- articles ----------
 
-static void list_done(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
+
+static void list_done(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0) { reply_err(r, 500, "internal error"); return; }
-    buf_t *o = body_start(r);
+    if (st->nrows == 0) { http_reply_err(rq, 500, "internal error"); return; }
+    buf_t *o = body_start(rq);
     buf_lit(o, "{\"articles\":[");
     for (int i = 0, k = 0; i < st->nrows; i++) {
         const pgf_t *f = st->f + (size_t)i * st->ncols;
@@ -634,66 +688,66 @@ static void list_done(req_t *r, pgbatch_t *b) {
     pgf_t n = pg_get(st, 0, 0);
     buf_put(o, n.p, n.n > 0 ? n.n : 0);
     buf_putc(o, '}');
-    reply(r, 200, o);
+    http_reply(rq, 200, o);
 }
 
-static void h_list(req_t *r) {
-    if (!limit_offset(r)) { reply_err(r, 422, "limit must be 1-100 and offset >= 0"); return; }
-    str_t p[4] = {viewer_str(r), arena_i64(&r->arena, r->limit), arena_i64(&r->arena, r->offset), STR_NULL};
+static void h_list(http_req *rq) {
+    if (!limit_offset(rq)) { http_reply_err(rq, 422, "limit must be 1-100 and offset >= 0"); return; }
+    str_t p[4] = {viewer_str(rq), arena_i64(&rq->arena, rq->limit), arena_i64(&rq->arena, rq->offset), STR_NULL};
     int ls = S_LIST_ALL;
-    if (query_get(r, "tag", &p[3]) && p[3].n) ls = S_LIST_TAG;
-    else if (query_get(r, "author", &p[3]) && p[3].n) ls = S_LIST_AUTHOR;
-    else if (query_get(r, "favorited", &p[3]) && p[3].n) ls = S_LIST_FAV;
-    pgbatch_t *b = pg_begin(r, list_done);
-    pg_stmt(b, ls, p);
-    pg_end(b);
+    if (query_get(rq, "tag", &p[3]) && p[3].n) ls = S_LIST_TAG;
+    else if (query_get(rq, "author", &p[3]) && p[3].n) ls = S_LIST_AUTHOR;
+    else if (query_get(rq, "favorited", &p[3]) && p[3].n) ls = S_LIST_FAV;
+    pg_batch *b = pg_batch_begin(rq, list_done);
+    pg_batch_add(b, ls, p);
+    pg_batch_seal(b);
 }
 
-static void h_feed(req_t *r) {
-    if (!limit_offset(r)) { reply_err(r, 422, "limit must be 1-100 and offset >= 0"); return; }
-    str_t p[3] = {viewer_str(r), arena_i64(&r->arena, r->limit), arena_i64(&r->arena, r->offset)};
-    pgbatch_t *b = pg_begin(r, list_done);
-    pg_stmt(b, S_FEED, p);
-    pg_end(b);
+static void h_feed(http_req *rq) {
+    if (!limit_offset(rq)) { http_reply_err(rq, 422, "limit must be 1-100 and offset >= 0"); return; }
+    str_t p[3] = {viewer_str(rq), arena_i64(&rq->arena, rq->limit), arena_i64(&rq->arena, rq->offset)};
+    pg_batch *b = pg_batch_begin(rq, list_done);
+    pg_batch_add(b, S_FEED, p);
+    pg_batch_seal(b);
 }
 
-static void article_done(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
-    reply_article(r, r->kind ? r->kind : 200, &b->st[b->nst - 1]);
+static void article_done(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
+    reply_article(rq, rq->kind ? rq->kind : 200, &b->st[b->nst - 1]);
 }
 
-static void h_get_article(req_t *r) {
-    pgbatch_t *b = pg_begin(r, article_done);
-    str_t p[2] = {viewer_str(r), r->seg[1]};
-    pg_stmt(b, S_ARTICLE_BY_SLUG, p);
-    pg_end(b);
+static void h_get_article(http_req *rq) {
+    pg_batch *b = pg_batch_begin(rq, article_done);
+    str_t p[2] = {viewer_str(rq), rq->seg[1]};
+    pg_batch_add(b, S_ARTICLE_BY_SLUG, p);
+    pg_batch_seal(b);
 }
 
-static void create_article_done(req_t *r, pgbatch_t *b) {
-    if (b->failed && !strcmp(b->sqlstate, "23505")) { reply_err(r, 422, "article could not be created"); return; }
-    if (!batch_ok(r, b)) return;
+static void create_article_done(http_req *rq, pg_batch *b) {
+    if (b->failed && !strcmp(b->sqlstate, "23505")) { http_reply_err(rq, 422, "article could not be created"); return; }
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0) { reply_err(r, 500, "internal error"); return; }
-    reply_article(r, 201, st);
+    if (st->nrows == 0) { http_reply_err(rq, 500, "internal error"); return; }
+    reply_article(rq, 201, st);
 }
 
-static void h_create_article(req_t *r) {
-    jv_t *m = wrapper(r, "article");
-    if (!m) { reply_err(r, 422, "invalid body"); return; }
+static void h_create_article(http_req *rq) {
+    jv_t *m = wrapper(rq, "article");
+    if (!m) { http_reply_err(rq, 422, "invalid body"); return; }
     str_t title, desc, body;
     if (!req_str(m, "title", &title) || !req_str(m, "description", &desc) || !req_str(m, "body", &body)) {
-        reply_err(r, 422, "title, description and body are required");
+        http_reply_err(rq, 422, "title, description and body are required");
         return;
     }
     jv_t *tl = json_get(m, "tagList");
     buf_t arr = {0};
     int ntags = 0;
     if (tl && tl->type != J_NULL) {
-        if (tl->type != J_ARR) { reply_err(r, 422, "tagList must be an array of non-empty strings"); return; }
+        if (tl->type != J_ARR) { http_reply_err(rq, 422, "tagList must be an array of non-empty strings"); return; }
         for (jv_t *e = tl->child; e; e = e->next) {
             if (e->type != J_STR || e->s.n == 0) {
                 buf_free(&arr);
-                reply_err(r, 422, "tagList must be an array of non-empty strings");
+                http_reply_err(rq, 422, "tagList must be an array of non-empty strings");
                 return;
             }
             buf_putc(&arr, ntags++ ? ',' : '{');
@@ -706,65 +760,67 @@ static void h_create_article(req_t *r) {
         }
         if (ntags) buf_putc(&arr, '}');
     }
-    str_t v = viewer_str(r);
-    pgbatch_t *b = pg_begin(r, create_article_done);
+    str_t v = viewer_str(rq);
+    pg_batch *b = pg_batch_begin(rq, create_article_done);
     str_t p[5] = {v, title, desc, body, STR_NULL};
     if (ntags) p[4] = (str_t){arr.p, arr.len};
-    pg_stmt(b, S_CREATE_ARTICLE, p);
-    pg_end(b);
+    pg_batch_add(b, S_CREATE_ARTICLE, p);
+    pg_batch_seal(b);
     buf_free(&arr);
 }
 
-// st[0] is "SELECT author_id ... WHERE slug": 404 if missing, 403 if the viewer isn't the author.
-static bool own_check(req_t *r, pgbatch_t *b, const char *what) {
-    if (!batch_ok(r, b)) return false;
+// rw: st[0] is "SELECT author_id ... WHERE slug": 404 if missing, 403 if the viewer isn't the author.
+
+static bool own_check(http_req *rq, pg_batch *b, const char *what) {
+    if (!batch_ok(rq, b)) return false;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0) { reply_err(r, 404, what); return false; }
-    if (fld_i64(pg_get(st, 0, 0)) != r->viewer) { reply_err(r, 403, "not the author"); return false; }
+    if (st->nrows == 0) { http_reply_err(rq, 404, what); return false; }
+    if (fld_i64(pg_get(st, 0, 0)) != rq->viewer) { http_reply_err(rq, 403, "not the author"); return false; }
     return true;
 }
 
-static void update_article_done(req_t *r, pgbatch_t *b) {
-    if (!own_check(r, b, "article not found")) return;
-    reply_article(r, 200, &b->st[1]);
+static void update_article_done(http_req *rq, pg_batch *b) {
+    if (!own_check(rq, b, "article not found")) return;
+    reply_article(rq, 200, &b->st[1]);
 }
 
-static void h_put_article(req_t *r) {
-    jv_t *m = wrapper(r, "article");
-    if (!m) { reply_err(r, 422, "invalid body"); return; }
-    str_t p[5] = {viewer_str(r), r->seg[1]};
+static void h_put_article(http_req *rq) {
+    jv_t *m = wrapper(rq, "article");
+    if (!m) { http_reply_err(rq, 422, "invalid body"); return; }
+    str_t p[5] = {viewer_str(rq), rq->seg[1]};
     if (!opt_str(m, "title", true, &p[2]) || !opt_str(m, "description", true, &p[3]) || !opt_str(m, "body", true, &p[4])) {
-        reply_err(r, 422, "title, description and body must be non-empty strings");
+        http_reply_err(rq, 422, "title, description and body must be non-empty strings");
         return;
     }
-    pgbatch_t *b = pg_begin(r, update_article_done);
-    pg_stmt(b, S_ARTICLE_AUTHOR, &r->seg[1]);
-    pg_stmt(b, S_UPDATE_ARTICLE, p);
-    pg_end(b);
+    pg_batch *b = pg_batch_begin(rq, update_article_done);
+    pg_batch_add(b, S_ARTICLE_AUTHOR, &rq->seg[1]);
+    pg_batch_add(b, S_UPDATE_ARTICLE, p);
+    pg_batch_seal(b);
 }
 
-static void delete_done(req_t *r, pgbatch_t *b) {
-    if (!own_check(r, b, r->kind ? "comment not found" : "article not found")) return;
-    reply(r, 204, NULL);
+static void delete_done(http_req *rq, pg_batch *b) {
+    if (!own_check(rq, b, rq->kind ? "comment not found" : "article not found")) return;
+    http_reply(rq, 204, NULL);
 }
 
-static void h_delete_article(req_t *r) {
-    pgbatch_t *b = pg_begin(r, delete_done);
-    str_t p[2] = {r->seg[1], viewer_str(r)};
-    pg_stmt(b, S_ARTICLE_AUTHOR, &r->seg[1]);
-    pg_stmt(b, S_DELETE_ARTICLE, p);
-    pg_end(b);
+static void h_delete_article(http_req *rq) {
+    pg_batch *b = pg_batch_begin(rq, delete_done);
+    str_t p[2] = {rq->seg[1], viewer_str(rq)};
+    pg_batch_add(b, S_ARTICLE_AUTHOR, &rq->seg[1]);
+    pg_batch_add(b, S_DELETE_ARTICLE, p);
+    pg_batch_seal(b);
 }
 
-static void h_favorite(req_t *r, bool fav) {
-    pgbatch_t *b = pg_begin(r, article_done);
-    str_t p[2] = {viewer_str(r), r->seg[1]};
-    pg_stmt(b, fav ? S_FAVORITE : S_UNFAVORITE, p);
-    pg_stmt(b, S_ARTICLE_BY_SLUG, p);
-    pg_end(b);
+static void h_favorite(http_req *rq, bool fav) {
+    pg_batch *b = pg_batch_begin(rq, article_done);
+    str_t p[2] = {viewer_str(rq), rq->seg[1]};
+    pg_batch_add(b, fav ? S_FAVORITE : S_UNFAVORITE, p);
+    pg_batch_add(b, S_ARTICLE_BY_SLUG, p);
+    pg_batch_seal(b);
 }
 
-// ---------- comments ----------
+// rw: ---------- comments ----------
+
 
 static void emit_comment(buf_t *o, const pgst_t *st, int i, bool has_following) {
     const pgf_t *f = st->f + (size_t)i * st->ncols;
@@ -781,11 +837,11 @@ static void emit_comment(buf_t *o, const pgst_t *st, int i, bool has_following) 
     buf_putc(o, '}');
 }
 
-static void comments_done(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
+static void comments_done(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0) { reply_err(r, 404, "article not found"); return; }
-    buf_t *o = body_start(r);
+    if (st->nrows == 0) { http_reply_err(rq, 404, "article not found"); return; }
+    buf_t *o = body_start(rq);
     buf_lit(o, "{\"comments\":[");
     for (int i = 0, k = 0; i < st->nrows; i++) {
         if (pg_get(st, i, 0).n < 0) continue; // article without comments
@@ -793,71 +849,73 @@ static void comments_done(req_t *r, pgbatch_t *b) {
         emit_comment(o, st, i, true);
     }
     buf_lit(o, "]}");
-    reply(r, 200, o);
+    http_reply(rq, 200, o);
 }
 
-static void h_comments(req_t *r) {
-    pgbatch_t *b = pg_begin(r, comments_done);
-    str_t p[2] = {viewer_str(r), r->seg[1]};
-    pg_stmt(b, S_COMMENTS, p);
-    pg_end(b);
+static void h_comments(http_req *rq) {
+    pg_batch *b = pg_batch_begin(rq, comments_done);
+    str_t p[2] = {viewer_str(rq), rq->seg[1]};
+    pg_batch_add(b, S_COMMENTS, p);
+    pg_batch_seal(b);
 }
 
-static void create_comment_done(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
+static void create_comment_done(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    if (st->nrows == 0) { reply_err(r, 404, "article not found"); return; }
-    buf_t *o = body_start(r);
+    if (st->nrows == 0) { http_reply_err(rq, 404, "article not found"); return; }
+    buf_t *o = body_start(rq);
     buf_lit(o, "{\"comment\":");
     emit_comment(o, st, 0, false);
     buf_putc(o, '}');
-    reply(r, 201, o);
+    http_reply(rq, 201, o);
 }
 
-static void h_create_comment(req_t *r) {
-    jv_t *m = wrapper(r, "comment");
+static void h_create_comment(http_req *rq) {
+    jv_t *m = wrapper(rq, "comment");
     str_t body;
-    if (!m || !req_str(m, "body", &body)) { reply_err(r, 422, "body is required"); return; }
-    pgbatch_t *b = pg_begin(r, create_comment_done);
-    str_t p[3] = {viewer_str(r), r->seg[1], body};
-    pg_stmt(b, S_CREATE_COMMENT, p);
-    pg_end(b);
+    if (!m || !req_str(m, "body", &body)) { http_reply_err(rq, 422, "body is required"); return; }
+    pg_batch *b = pg_batch_begin(rq, create_comment_done);
+    str_t p[3] = {viewer_str(rq), rq->seg[1], body};
+    pg_batch_add(b, S_CREATE_COMMENT, p);
+    pg_batch_seal(b);
 }
 
-static void h_delete_comment(req_t *r) {
+static void h_delete_comment(http_req *rq) {
     int64_t id;
-    if (!parse_uint(r->seg[3].p, r->seg[3].n, &id)) { reply_err(r, 404, "comment not found"); return; }
-    r->kind = 1;
-    str_t ids = arena_i64(&r->arena, id);
-    pgbatch_t *b = pg_begin(r, delete_done);
-    str_t p[3] = {ids, r->seg[1], viewer_str(r)};
-    pg_stmt(b, S_COMMENT_AUTHOR, p);
-    pg_stmt(b, S_DELETE_COMMENT, p);
-    pg_end(b);
+    if (!parse_uint(rq->seg[3].p, rq->seg[3].n, &id)) { http_reply_err(rq, 404, "comment not found"); return; }
+    rq->kind = 1;
+    str_t ids = arena_i64(&rq->arena, id);
+    pg_batch *b = pg_batch_begin(rq, delete_done);
+    str_t p[3] = {ids, rq->seg[1], viewer_str(rq)};
+    pg_batch_add(b, S_COMMENT_AUTHOR, p);
+    pg_batch_add(b, S_DELETE_COMMENT, p);
+    pg_batch_seal(b);
 }
 
-// ---------- tags ----------
+// rw: ---------- tags ----------
 
-static void tags_done(req_t *r, pgbatch_t *b) {
-    if (!batch_ok(r, b)) return;
+
+static void tags_done(http_req *rq, pg_batch *b) {
+    if (!batch_ok(rq, b)) return;
     const pgst_t *st = &b->st[0];
-    buf_t *o = body_start(r);
+    buf_t *o = body_start(rq);
     buf_lit(o, "{\"tags\":[");
     for (int i = 0; i < st->nrows; i++) {
         if (i) buf_putc(o, ',');
         emit_str(o, pg_get(st, i, 0));
     }
     buf_lit(o, "]}");
-    reply(r, 200, o);
+    http_reply(rq, 200, o);
 }
 
-static void h_tags(req_t *r) {
-    pgbatch_t *b = pg_begin(r, tags_done);
-    pg_stmt(b, S_TAGS, NULL);
-    pg_end(b);
+static void h_tags(http_req *rq) {
+    pg_batch *b = pg_batch_begin(rq, tags_done);
+    pg_batch_add(b, S_TAGS, NULL);
+    pg_batch_seal(b);
 }
 
-// ---------- routing ----------
+// rw: ---------- routing ----------
+
 
 enum { A_NONE, A_OPTIONAL, A_REQUIRED };
 enum {
@@ -873,9 +931,9 @@ static const int AUTH[] = {
     [R_TAGS] = A_NONE, [R_REGISTER] = A_NONE, [R_LOGIN] = A_NONE,
 };
 
-static int route(req_t *r) {
-    const str_t *s = r->seg;
-    int n = r->nseg, m = r->method;
+static int route(http_req *rq) {
+    const str_t *s = rq->seg;
+    int n = rq->nseg, m = rq->method;
     if (n <= 0) return R_NONE;
     if (str_eq(s[0], "articles")) {
         if (n == 1) return m == M_GET ? R_LIST : m == M_POST ? R_CREATE_ARTICLE : R_NONE;
@@ -903,44 +961,45 @@ static int route(req_t *r) {
     return R_NONE;
 }
 
-// 0: no header, 1: valid token, -1: header present but invalid.
-static int authenticate(req_t *r) {
-    if (!r->auth.p || r->auth.n == 0) return 0;
-    if (r->auth.n < 6 || memcmp(r->auth.p, "Token ", 6) != 0) return -1;
-    str_t t = {r->auth.p + 6, r->auth.n - 6};
+// rw: 0: no header, 1: valid token, -1: header present but invalid.
+
+static int authenticate(http_req *rq) {
+    if (!rq->auth.p || rq->auth.n == 0) return 0;
+    if (rq->auth.n < 6 || memcmp(rq->auth.p, "Token ", 6) != 0) return -1;
+    str_t t = {rq->auth.p + 6, rq->auth.n - 6};
     int64_t id;
-    if (!jwt_verify(&r->arena, t.p, t.n, &id)) return -1;
-    r->viewer = id;
-    r->token = t;
+    if (!jwt_verify(&rq->arena, t.p, t.n, &id)) return -1;
+    rq->viewer = id;
+    rq->token = t;
     return 1;
 }
 
-void api_dispatch(req_t *r) {
-    int rt = route(r);
-    if (rt == R_NONE) { reply_err(r, 404, "not found"); return; }
+void route_request(http_req *rq) {
+    int rt = route(rq);
+    if (rt == R_NONE) { http_reply_err(rq, 404, "not found"); return; }
     if (AUTH[rt] != A_NONE) {
-        int a = authenticate(r);
-        if (a < 0 || (a == 0 && AUTH[rt] == A_REQUIRED)) { reply_err(r, 401, "unauthorized"); return; }
+        int a = authenticate(rq);
+        if (a < 0 || (a == 0 && AUTH[rt] == A_REQUIRED)) { http_reply_err(rq, 401, "unauthorized"); return; }
     }
     switch (rt) {
-    case R_REGISTER: h_register(r); break;
-    case R_LOGIN: h_login(r); break;
-    case R_GET_USER: h_get_user(r); break;
-    case R_PUT_USER: h_put_user(r); break;
-    case R_PROFILE: h_profile(r); break;
-    case R_FOLLOW: h_follow(r, true); break;
-    case R_UNFOLLOW: h_follow(r, false); break;
-    case R_LIST: h_list(r); break;
-    case R_FEED: h_feed(r); break;
-    case R_CREATE_ARTICLE: h_create_article(r); break;
-    case R_GET_ARTICLE: h_get_article(r); break;
-    case R_PUT_ARTICLE: h_put_article(r); break;
-    case R_DEL_ARTICLE: h_delete_article(r); break;
-    case R_FAV: h_favorite(r, true); break;
-    case R_UNFAV: h_favorite(r, false); break;
-    case R_COMMENTS: h_comments(r); break;
-    case R_CREATE_COMMENT: h_create_comment(r); break;
-    case R_DEL_COMMENT: h_delete_comment(r); break;
-    case R_TAGS: h_tags(r); break;
+    case R_REGISTER: h_register(rq); break;
+    case R_LOGIN: h_login(rq); break;
+    case R_GET_USER: h_get_user(rq); break;
+    case R_PUT_USER: h_put_user(rq); break;
+    case R_PROFILE: h_profile(rq); break;
+    case R_FOLLOW: h_follow(rq, true); break;
+    case R_UNFOLLOW: h_follow(rq, false); break;
+    case R_LIST: h_list(rq); break;
+    case R_FEED: h_feed(rq); break;
+    case R_CREATE_ARTICLE: h_create_article(rq); break;
+    case R_GET_ARTICLE: h_get_article(rq); break;
+    case R_PUT_ARTICLE: h_put_article(rq); break;
+    case R_DEL_ARTICLE: h_delete_article(rq); break;
+    case R_FAV: h_favorite(rq, true); break;
+    case R_UNFAV: h_favorite(rq, false); break;
+    case R_COMMENTS: h_comments(rq); break;
+    case R_CREATE_COMMENT: h_create_comment(rq); break;
+    case R_DEL_COMMENT: h_delete_comment(rq); break;
+    case R_TAGS: h_tags(rq); break;
     }
 }

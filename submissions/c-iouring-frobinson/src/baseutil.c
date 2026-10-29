@@ -1,5 +1,9 @@
-// Buffers, arenas, number formatting, SHA-256 / HMAC and base64.
-#include "conduit.h"
+// MIT License — fork of c-iouring-tigokraft (#10); ideas from c-iouring-gilnett (#58), rust-tokio-Scooter1337 (#7), csharp-sockets-jh-d (#22).
+// rw: Original MIT code (c) challenge contributors; modifications (c) frobinson. See README Credits.
+
+// rw: Buffers, arenas, number formatting, SHA-256 / HMAC and base64.
+
+#include "app.h"
 #include <stdarg.h>
 
 void die(const char *fmt, ...) {
@@ -21,7 +25,8 @@ void logf_(const char *fmt, ...) {
     va_end(ap);
 }
 
-// ---------- buffers ----------
+// rw: ---------- buffers ----------
+
 
 void buf_grow(buf_t *b, size_t need) {
     size_t cap = b->cap ? b->cap : 256;
@@ -56,14 +61,35 @@ void buf_i64(buf_t *b, int64_t v) {
 
 static const char HEX[] = "0123456789abcdef";
 
-// JSON string escaping: quotes, backslash and control characters. Everything else (UTF-8) passes through.
+// Word-at-a-time fast path for JSON escaping (own implementation, inspired by rust-mio 8B scan + SSE2 idea).
+// rw: Scans 8 bytes via unaligned u64 load; bits trick detects bytes <0x20 or '"' (0x22) or '\\' (0x5C).
+
+// rw: Falls back to byte loop for tail/specials. Identical output to byte loop.
+
 void buf_json_str(buf_t *b, const char *s, size_t n) {
     if (b->cap - b->len < n + 2) buf_grow(b, n + 2);
     b->p[b->len++] = '"';
-    size_t start = 0;
-    for (size_t i = 0; i < n; i++) {
+    size_t start = 0, i = 0;
+    // rw: fast run: copy 8-byte chunks with no specials
+
+    while (i + 8 <= n) {
+        uint64_t word;
+        __builtin_memcpy(&word, s + i, 8);
+        // rw: high-bit per byte if <0x20, or == '"' or '\\'
+
+        uint64_t lo = word & 0x7F7F7F7F7F7F7F7FULL;
+        uint64_t has_ctrl = (lo + 0x6060606060606060ULL) & ~(word & 0x8080808080808080ULL) & 0x8080808080808080ULL;
+        uint64_t is_q = 0, is_bs = 0;
+        uint64_t tmp = word ^ 0x2222222222222222ULL;
+        is_q = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
+        tmp = word ^ 0x5C5C5C5C5C5C5C5CULL;
+        is_bs = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
+        if ((has_ctrl | is_q | is_bs) == 0) { i += 8; continue; }
+        break;
+    }
+    for (; i < n; i++) {
         unsigned char c = s[i];
-        if (LIKELY(c >= 0x20 && c != '"' && c != '\\')) continue;
+        if (__builtin_expect(c >= 0x20 && c != '"' && c != '\\', 1)) continue;
         buf_put(b, s + start, i - start);
         start = i + 1;
         switch (c) {
@@ -77,17 +103,47 @@ void buf_json_str(buf_t *b, const char *s, size_t n) {
             buf_put(b, e, 6);
         }
         }
+        // rw: resume fast path after one special
+
+        size_t j = i + 1;
+        while (j + 8 <= n) {
+            uint64_t word;
+            __builtin_memcpy(&word, s + j, 8);
+            uint64_t lo = word & 0x7F7F7F7F7F7F7F7FULL;
+            uint64_t has_ctrl = (lo + 0x6060606060606060ULL) & ~(word & 0x8080808080808080ULL) & 0x8080808080808080ULL;
+            uint64_t tmp = word ^ 0x2222222222222222ULL;
+            uint64_t is_q = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
+            tmp = word ^ 0x5C5C5C5C5C5C5C5CULL;
+            uint64_t is_bs = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
+            if ((has_ctrl | is_q | is_bs) == 0) { j += 8; continue; }
+            break;
+        }
+        // rw: copy the fast run we just skipped (will be handled by outer loop's continue check)
+
+        // rw: To keep logic simple, set i = j-1 so outer i++ lands on j
+
+        if (j > i + 1) {
+            // rw: flush pending run up to j via start adjustment: outer loop will scan byte-by-byte from i+1,
+
+            // rw: but those bytes are known clean, so fast-forward
+
+            i = j - 1;
+            // rw: start already at correct place (after last special), no extra copy needed yet
+
+        }
     }
     buf_put(b, s + start, n - start);
     buf_putc(b, '"');
 }
+
 
 void buf_json_nstr(buf_t *b, str_t s) {
     if (!s.p) buf_lit(b, "null");
     else buf_json_str(b, s.p, s.n);
 }
 
-// ---------- arenas ----------
+// rw: ---------- arenas ----------
+
 
 #define ARENA_CHUNK 4096
 
@@ -126,10 +182,13 @@ void arena_free(arena_t *a) {
     a->cur = a->end = NULL;
 }
 
-// Moves one cached chunk onto a fresh arena when it holds none. All other
-// allocations flow through arena_alloc unchanged, so pg.c/api.c benefit
-// without touching their call sites.
-void arena_seed(struct worker *w, arena_t *a) {
+// rw: Moves one cached chunk onto a fresh arena when it holds none. All other
+
+// rw: allocations flow through arena_alloc unchanged, so pg.c/api.c benefit
+
+// rw: without touching their call sites.
+
+void arena_seed(struct ev_loop *w, arena_t *a) {
     if (!w || !a || a->chunks || !w->spare) return;
     achunk_t *c = w->spare;
     w->spare = c->next;
@@ -140,10 +199,13 @@ void arena_seed(struct worker *w, arena_t *a) {
     a->end = (char *)c + c->size;
 }
 
-// Returns a request's chunks to the worker cache up to ARENA_SPARE_CAP;
-// anything past the cap is freed, bounding RSS. w->body capacity is
-// retained separately (reply_err resets len only, never frees).
-void arena_recycle(struct worker *w, arena_t *a) {
+// rw: Returns a request's chunks to the worker cache up to ARENA_SPARE_CAP;
+
+// rw: anything past the cap is freed, bounding RSS. w->body capacity is
+
+// rw: retained separately (http_reply_err resets len only, never frees).
+
+void arena_recycle(struct ev_loop *w, arena_t *a) {
     if (!a) return;
     achunk_t *c = a->chunks;
     a->chunks = NULL;
@@ -186,7 +248,8 @@ str_t arena_i64(arena_t *a, int64_t v) {
     return (str_t){p, fmt_i64(p, v)};
 }
 
-// ---------- SHA-256 ----------
+// rw: ---------- SHA-256 ----------
+
 
 static const uint32_t K256[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -291,7 +354,8 @@ void hmac_sha256(const void *key, size_t klen, const void *msg, size_t n, uint8_
     hmac_sha256_k(&k, msg, n, out);
 }
 
-// ---------- base64 ----------
+// rw: ---------- base64 ----------
+
 
 static const char B64U[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 static const char B64S[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

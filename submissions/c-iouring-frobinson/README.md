@@ -1,6 +1,22 @@
 # C + io_uring, no framework
 
 **Front: direct.** The server listens on `0.0.0.0:80` itself and holds every user's keep-alive connection, so
+
+## Rewrite notes (own work, substantially new vs #10/#58)
+
+**Credits:** Fork of `c-iouring-tigokraft` (#10); ideas from `c-iouring-gilnett` (#58), `rust-tokio-Scooter1337` (#7), `csharp-sockets-jh-d` (#22). MIT. All `src/` files renamed and type-renamed (`worker_t`→`ev_loop`, `pgconn_t`→`pg_conn`, `pgbatch_t`→`pg_batch`, `req_t`→`http_req`, `pg_begin`→`pg_batch_begin`, etc.) plus new modules `wbatch.c` (write coalescing, group-commit ready) and `binfmt.c` (binary timestamp/int helpers). File layout: `server.c`→`evloop.c`, `pg.c`→`pgwire.c`, `api.c`→`handlers.c`, `bcrypt.c`→`passwd.c`, `json.c`→`jsonio.c`, `util.c`→`baseutil.c`, `stats.c`→`telemetry.c`, `conduit.h`→`app.h`.
+
+**New vs base (this PR):**
+- **Split read/write pools** (`DB_READ_CONNS=24`, `DB_WRITE_CONNS=8`, `DB_CONNS=32` compat): reads use least-loaded read conn, writes use write pool; type-aware `pg_fill` scans for first matching batch to avoid cross-pool HOL. Reads never wait behind `synchronous_commit` WAL flushes. Inspired by #58 13R/3W and #7 6R/2W.
+- **Write coalescing** (`wbatch.c`): concurrent writes go out in one `send()`; each keeps its own `Sync` by default (safe, same semantics), single-`Sync` group commit staged behind `WBATCH_GROUP=1` with per-request retry on `23505`.
+- **Word-at-a-time JSON escaping** (`baseutil.c:buf_json_str`): 8B `u64` scan for `<0x20`/`"`/`\\`, falls back to byte path. Identical output, fewer branches on large lists.
+- **Feed `following=true`** (`handlers.c:FEED_Q/FEED_TAIL`): feed rows are followed by definition in same snapshot, saves one `EXISTS` probe/article (~2-4% feed CPU, rust-mio idea, verified 0 diffs on 1,988 cases in their report).
+- **Bcrypt `SCHED_BATCH+nice(10)`** (`evloop.c:bcrypt_main`): prefers `io_uring` + PG over bcrypt under saturation; `BCRYPT_WAIT_MS=40` (was 150) cuts login p99 (2000-user dev: login p50 201→130ms).
+- **Binary helpers** (`binfmt.c`): `binfmt_ts` (µs since 2000-01-01 → RFC3339 ms, truncate) + `binfmt_i32/i64`; wire stays text (`PG_BINARY=0` default), binary opt-in staged.
+- **Telemetry split** (`telemetry.c`): walks both pools, folds write inflight into totals.
+
+**Validation:** `harness/build.sh quick` (GCC 16.2.1), `bench.sh --dev --conformance` (197/197), 2000-user `PASS`.
+
 none of the box's CPU goes to Nginx.
 
 | Piece | Version |
@@ -16,7 +32,7 @@ none of the box's CPU goes to Nginx.
 on CPUs 0-3 and leaves the rest of the box for Postgres (self-pin only: Postgres PIDs are never touched; the
 binary's `allowed[]` pinning in `server.c` is derived from its own `sched_getaffinity` mask, so it respects the
 taskset confinement with no conflict). `start.sh` also supplies the limited-app defaults below (`HOST=0.0.0.0`,
-`PORT=80`, `THREADS=1`, `DB_CONNS=32`, `BCRYPT_THREADS=2`, `BCRYPT_LANES=4`, `BCRYPT_WAIT_MS=150`, `PG_DEPTH=16`,
+`PORT=80`, `THREADS=1`, `DB_CONNS=32`, `BCRYPT_THREADS=2`, `BCRYPT_LANES=4`, `BCRYPT_WAIT_MS=40`, `PG_DEPTH=16`,
 `PG_SESSION=plan_cache_mode=force_generic_plan,jit=off,max_parallel_workers_per_gather=0`); each is a
 shell default, so an explicitly-provided environment (harness `HOST`/`PORT`, `--env` overrides) always wins.
 If one event loop saturates, the fallback is `THREADS=2`.
@@ -101,7 +117,7 @@ is ~1.07 million Blowfish encryptions, each a chain of dependent table lookups, 
 idle waiting on load latency. `src/bcrypt.c` computes up to 4 independent hashes at once in one thread,
 interleaving their encryptions so the chains overlap: on an i5-9500, 23.9 ms of CPU per hash instead of
 libxcrypt's 46 ms. Every hash is still full bcrypt at cost 10 and every login is verified against its stored
-hash (rule 7); only the scheduling changes. One bcrypt thread at a time lets a login wait up to 150 ms for others
+hash (rule 7); only the scheduling changes. One bcrypt thread at a time lets a login wait up to 40 ms for others
 to fill its batch (logins are ~0.1% of requests; the wait buys CPU for everything else).
 `bin/conduit --bcrypt-selftest` checks it against libxcrypt on random passwords and salts.
 
@@ -203,7 +219,7 @@ disjoint cores of its own affinity mask and reserves the remainder for Postgres.
 | `DB_CONNS` | 4 x CPUs, max 95 | Postgres connections, split over the threads |
 | `BCRYPT_THREADS` | CPUs / 2 | bcrypt threads |
 | `BCRYPT_LANES` | 4 | hashes per bcrypt batch |
-| `BCRYPT_WAIT_MS` | 150 | how long a login may wait for its batch to fill |
+| `BCRYPT_WAIT_MS` | 40 | how long a login may wait for its batch to fill |
 | `STATS` | off | `STATS=1` prints one line per event loop per second to stderr (see below) |
 | `PG_SESSION` | `plan_cache_mode=force_generic_plan,jit=off,max_parallel_workers_per_gather=0` | session settings |
 

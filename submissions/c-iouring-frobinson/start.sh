@@ -8,7 +8,7 @@
 #   HOST, PORT    127.0.0.1:3000 behind Nginx; 0.0.0.0:80 if serving directly
 #
 # Optional tuning knobs we support (forwarded like everything else):
-#   THREADS, DB_CONNS, BCRYPT_THREADS, BCRYPT_LANES, BCRYPT_WAIT_MS,
+#   THREADS, DB_CONNS, DB_READ_CONNS, DB_WRITE_CONNS, BCRYPT_THREADS, BCRYPT_LANES, BCRYPT_WAIT_MS,
 #   PG_DEPTH, PG_SESSION, STATS
 #
 # `exec` replaces the shell so the process hands SIGTERM/SIGINT straight to
@@ -37,9 +37,12 @@ export HOST PORT
 export THREADS
 : "${DB_CONNS:=32}"
 export DB_CONNS
+: "${DB_READ_CONNS:=24}"
+: "${DB_WRITE_CONNS:=8}"
+export DB_READ_CONNS DB_WRITE_CONNS
 : "${BCRYPT_THREADS:=2}"
 : "${BCRYPT_LANES:=4}"
-: "${BCRYPT_WAIT_MS:=150}"
+: "${BCRYPT_WAIT_MS:=40}"
 export BCRYPT_THREADS BCRYPT_LANES BCRYPT_WAIT_MS
 : "${PG_DEPTH:=16}"
 export PG_DEPTH

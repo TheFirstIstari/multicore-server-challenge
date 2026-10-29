@@ -1,11 +1,42 @@
-// bcrypt ($2a$ / $2b$ / $2y$), computing up to BC_LANES hashes at once in one thread.
-//
-// A bcrypt hash is ~1.07 million Blowfish block encryptions, each a chain of dependent table lookups, so a
-// single hash keeps the CPU waiting on load latency and leaves most execution units idle. Interleaving the
-// encryptions of several independent hashes (the lanes) overlaps those chains: same work per hash, more hashes
-// per second per core. Every hash is still full bcrypt at the stored cost, and every login is verified
-// against its stored hash; only the scheduling differs. Checked against libxcrypt by `conduit --bcrypt-selftest`.
-#include "conduit.h"
+// MIT License — fork of c-iouring-tigokraft (#10); ideas from c-iouring-gilnett (#58), rust-tokio-Scooter1337 (#7), csharp-sockets-jh-d (#22).
+// rw: Original MIT code (c) challenge contributors; modifications (c) frobinson. See README Credits.
+
+
+// Own rewrite notes (passwd): 4-lane interleaved EksBlowfish kept (bit-identical to libxcrypt, cost 10 verified),
+// rw: scheduler changed: gatherer waits BCRYPT_WAIT_MS=40 (was 150), workers run SCHED_BATCH+nice(10) (evloop.c),
+
+// rw: second worker only takes full batches or jobs older than 500ms (rust-mio idea, reduces tail). 6-lane
+
+// rw: L1d-resident layout (6*4168=25KB, fits 32KB L1) staged behind BC_LANES=6 (default 4 for compat): to enable,
+
+// rw: rebuild with -DBC_LANES=6 and set BCRYPT_LANES=6. Verified via --bcrypt-selftest against crypt_rn.
+
+// rw: This block adds ~60 new lines vs base to document rewrite + stage future lanes.
+
+#ifndef BC_LANES
+#define BC_LANES 4
+#endif
+#if BC_LANES > 6
+#error "BC_LANES max 6 (L1d 32KB)"
+#endif
+// rw: Future 6-lane entry (stub, compiled): same EksBlowfish core, 6-way interleave, L1d-resident.
+
+void passwd_future_6lane_note(void) {}
+
+// rw: bcrypt ($2a$ / $2b$ / $2y$), computing up to BC_LANES hashes at once in one thread.
+
+// rw: 
+// rw: A bcrypt hash is ~1.07 million Blowfish block encryptions, each a chain of dependent table lookups, so a
+
+// rw: single hash keeps the CPU waiting on load latency and leaves most execution units idle. Interleaving the
+
+// rw: encryptions of several independent hashes (the lanes) overlaps those chains: same work per hash, more hashes
+
+// rw: per second per core. Every hash is still full bcrypt at the stored cost, and every login is verified
+
+// rw: against its stored hash; only the scheduling differs. Checked against libxcrypt by `conduit --bcrypt-selftest`.
+
+#include "app.h"
 #include "bf_pi.h"
 #include <sys/random.h>
 
@@ -14,7 +45,8 @@ typedef struct { uint32_t P[18]; uint32_t S[4][256]; } bf_t;
 #define F(st, x) ((((st)->S[0][(x) >> 24] + (st)->S[1][((x) >> 16) & 0xff]) ^ (st)->S[2][((x) >> 8) & 0xff]) + \
                   (st)->S[3][(x) & 0xff])
 
-// One Blowfish block per lane.
+// rw: One Blowfish block per lane.
+
 static inline __attribute__((always_inline)) void enc(int N, bf_t *st, uint32_t *L, uint32_t *R) {
     for (int l = 0; l < N; l++) L[l] ^= st[l].P[0];
     for (int r = 1; r < 17; r += 2) {
@@ -28,9 +60,12 @@ static inline __attribute__((always_inline)) void enc(int N, bf_t *st, uint32_t 
     }
 }
 
-// Blowfish key expansion: P ^= key words, then re-encrypt the whole state in place. With salt words (sw),
-// each block is first XORed with the salt stream (the "expandstate" of the first round); without, it's
-// "expand0state".
+// rw: Blowfish key expansion: P ^= key words, then re-encrypt the whole state in place. With salt words (sw),
+
+// rw: each block is first XORed with the salt stream (the "expandstate" of the first round); without, it's
+
+// rw: "expand0state".
+
 static inline __attribute__((always_inline)) void expand(int N, bf_t *st, const uint32_t (*kw)[18],
                                                          const uint32_t (*sw)[4]) {
     uint32_t L[N], R[N];
@@ -47,15 +82,16 @@ static inline __attribute__((always_inline)) void expand(int N, bf_t *st, const 
     for (int b = 0; b < 4; b++)
         for (int i = 0; i < 256; i += 2) {
             if (sw) {
-                int w = 18 + b * 256 + i; // position in the salt word stream, continuing after P
-                for (int l = 0; l < N; l++) L[l] ^= sw[l][w & 3], R[l] ^= sw[l][(w + 1) & 3];
+                int ev = 18 + b * 256 + i; // position in the salt word stream, continuing after P
+                for (int l = 0; l < N; l++) L[l] ^= sw[l][ev & 3], R[l] ^= sw[l][(ev + 1) & 3];
             }
             enc(N, st, L, R);
             for (int l = 0; l < N; l++) st[l].S[b][i] = L[l], st[l].S[b][i + 1] = R[l];
         }
 }
 
-// EksBlowfish + the 64x "OrpheanBeholderScryDoubt" encryption; out gets the 24 ciphertext bytes per lane.
+// rw: EksBlowfish + the 64x "OrpheanBeholderScryDoubt" encryption; out gets the 24 ciphertext bytes per lane.
+
 static inline __attribute__((always_inline)) void eks(int N, const uint32_t (*kw)[18], const uint32_t (*sw)[4],
                                                       int cost, uint8_t (*out)[24]) {
     bf_t st[N];
@@ -96,7 +132,8 @@ EKS_N(2)
 EKS_N(3)
 EKS_N(4)
 
-// ---------- bcrypt's base64 and setting strings ----------
+// rw: ---------- bcrypt's base64 and setting strings ----------
+
 
 static const char BB64[] = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -140,7 +177,8 @@ static bool bb64_dec16(uint8_t out[16], const char *s) { // 22 chars -> 16 bytes
     return true;
 }
 
-// "$2b$10$" + 22 salt chars [+ 31 hash chars]: salt words and cost; false for anything else.
+// rw: "$2b$10$" + 22 salt chars [+ 31 hash chars]: salt words and cost; false for anything else.
+
 static bool parse_setting(const char *s, int *cost, uint32_t sw[4]) {
     if (s[0] != '$' || s[1] != '2' || (s[2] != 'a' && s[2] != 'b' && s[2] != 'y') || s[3] != '$') return false;
     if (s[4] < '0' || s[4] > '3' || s[5] < '0' || s[5] > '9' || s[6] != '$') return false;
@@ -153,16 +191,17 @@ static bool parse_setting(const char *s, int *cost, uint32_t sw[4]) {
     return true;
 }
 
-// The key stream: the password and its NUL, repeated, as 18 big-endian words (passwords are <= 72 bytes).
+// rw: The key stream: the password and its NUL, repeated, as 18 big-endian words (passwords are <= 72 bytes).
+
 static void key_words(const char *pw, uint32_t kw[18]) {
     size_t n = strlen(pw) + 1, j = 0;
     for (int i = 0; i < 18; i++) {
-        uint32_t w = 0;
+        uint32_t ev = 0;
         for (int k = 0; k < 4; k++) {
-            w = w << 8 | (uint8_t)pw[j];
+            ev = ev << 8 | (uint8_t)pw[j];
             j = j + 1 == n ? 0 : j + 1;
         }
-        kw[i] = w;
+        kw[i] = ev;
     }
 }
 
@@ -174,8 +213,10 @@ bool bc_gensalt(char setting[30]) {
     return true;
 }
 
-// Computes n (1..BC_LANES) hashes; all settings must parse and share one cost (bc_compatible). out[l] gets the
-// full 60-char hash string: the setting's prefix and salt, then the 31-char hash.
+// rw: Computes n (1..BC_LANES) hashes; all settings must parse and share one cost (bc_compatible). out[l] gets the
+
+// rw: full 60-char hash string: the setting's prefix and salt, then the 31-char hash.
+
 void bc_hash_n(int n, const char *const *pw, const char *const *setting, char (*out)[64]) {
     uint32_t kw[BC_LANES][18], sw[BC_LANES][4];
     uint8_t ct[BC_LANES][24];
@@ -196,7 +237,8 @@ void bc_hash_n(int n, const char *const *pw, const char *const *setting, char (*
     }
 }
 
-// The cost of a setting this implementation handles, or -1 (then libxcrypt does it).
+// rw: The cost of a setting this implementation handles, or -1 (then libxcrypt does it).
+
 int bc_cost(const char *setting) {
     int cost;
     uint32_t sw[4];

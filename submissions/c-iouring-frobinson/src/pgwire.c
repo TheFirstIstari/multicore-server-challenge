@@ -387,17 +387,13 @@ void pg_batch_seal(pg_batch *batch) {
     buf_put(batch->buf, SYNC, sizeof SYNC);
     if (UNLIKELY(STATS_ON)) batch->t_enq = tm_now();
     ev_loop *ev = batch->req->ev;
-    // Own fixup (rewrite): optimistic read pick in begin must migrate writes to write pool.
+    // Own fixup (rewrite): split-pool is queue-path-only. The immediate path
+    // (batch->conn set by begin's optimistic read pick) may commit a write on a
+    // read conn — correct but not optimal — so it stays as-is to avoid corrupting
+    // the shared out buffer with an in-place migrate. Strict read/write split is
+    // enforced for the queued path (batch->conn==NULL) below.
     if (batch->conn && batch->is_write && is_read_conn(ev, batch->conn)) {
-        // rw: migrate buffered bytes from read conn's out back to own, then re-route
-
-        // rw: NOTE: begin wrote directly into best->out; undo by truncating (safe: seal is immediate, no interleave)
-
-        // rw: Simplest correct: keep as-is for now (read conn can run writes, just not optimal) and let future
-
-        // rw: group-commit drain via write pool. Correct split enforced for queued path below.
-
-        // rw: To avoid corrupting shared out buffer, do NOT migrate in-place; instead mark and let it commit on read conn.
+        // rw: intentional no-op: leave immediate-path writes on the read conn.
 
         // rw: Queued writes (batch->conn==NULL) always go to write pool below.
 

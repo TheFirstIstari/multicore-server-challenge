@@ -8,7 +8,7 @@
 
 **New vs base (this PR):**
 - **Split read/write pools** (`DB_READ_CONNS=24`, `DB_WRITE_CONNS=8`, `DB_CONNS=32` compat): reads use least-loaded read conn, writes use write pool; type-aware `pg_fill` scans for first matching batch to avoid cross-pool HOL. Reads never wait behind `synchronous_commit` WAL flushes. Inspired by #58 13R/3W and #7 6R/2W.
-- **Write coalescing** (`wbatch.c`): concurrent writes go out in one `send()`; each keeps its own `Sync` by default (safe, same semantics), single-`Sync` group commit staged behind `WBATCH_GROUP=1` with per-request retry on `23505`.
+- **Write coalescing** (`wbatch.c`, staged): coalesced `send()` + single-`Sync` group commit staged behind `WBATCH_GROUP=1` with per-request retry on `23505`; currently per-`Sync` safe default (same semantics as before), drain is a no-op (see `src/wbatch.c:7`).
 - **Word-at-a-time JSON escaping** (`baseutil.c:buf_json_str`): 8B `u64` scan for `<0x20`/`"`/`\\`, falls back to byte path. Identical output, fewer branches on large lists.
 - **Feed `following=true`** (`handlers.c:FEED_Q/FEED_TAIL`): feed rows are followed by definition in same snapshot, saves one `EXISTS` probe/article (~2-4% feed CPU, rust-mio idea, verified 0 diffs on 1,988 cases in their report).
 - **Bcrypt `SCHED_BATCH+nice(10)`** (`evloop.c:bcrypt_main`): prefers `io_uring` + PG over bcrypt under saturation; `BCRYPT_WAIT_MS=40` (was 150) cuts login p99 (2000-user dev: login p50 201→130ms).
@@ -24,13 +24,13 @@ none of the box's CPU goes to Nginx.
 | Language | C (gnu11), GCC 13.3 from Ubuntu 24.04 (`build-essential`) |
 | I/O | io_uring via liburing 2.5 (Ubuntu 24.04 `liburing-dev`) |
 | HTTP/1.1, JSON, JWT (HS256), SHA-256 | hand-written, in `src/` |
-| Postgres driver | hand-written wire-protocol v3 client (`src/pg.c`): SCRAM-SHA-256, prepared statements, pipelining |
-| bcrypt | `src/bcrypt.c` (4-lane interleaved, see below), libxcrypt 4.4.36 as the fallback for other hash formats |
+| Postgres driver | hand-written wire-protocol v3 client (`src/pgwire.c`): SCRAM-SHA-256, prepared statements, pipelining |
+| bcrypt | `src/passwd.c` (4-lane interleaved, see below), libxcrypt 4.4.36 as the fallback for other hash formats |
 
 `install.sh` installs `build-essential liburing-dev libcrypt-dev` from the Ubuntu archive. `build.sh` is a single
 `gcc` call. `start.sh` runs `bin/conduit` in the foreground, self-pinned with `taskset -c 0-3` so the app lives
 on CPUs 0-3 and leaves the rest of the box for Postgres (self-pin only: Postgres PIDs are never touched; the
-binary's `allowed[]` pinning in `server.c` is derived from its own `sched_getaffinity` mask, so it respects the
+binary's `allowed[]` pinning in `evloop.c` is derived from its own `sched_getaffinity` mask, so it respects the
 taskset confinement with no conflict). `start.sh` also supplies the limited-app defaults below (`HOST=0.0.0.0`,
 `PORT=80`, `THREADS=1`, `DB_CONNS=32`, `BCRYPT_THREADS=2`, `BCRYPT_LANES=4`, `BCRYPT_WAIT_MS=40`, `PG_DEPTH=16`,
 `PG_SESSION=plan_cache_mode=force_generic_plan,jit=off,max_parallel_workers_per_gather=0`); each is a
@@ -114,7 +114,7 @@ on one backend, raising p99.
 Logins grow with users (each user starts a session every ~15 minutes; a quarter of those log in), so at the
 user counts this server reaches, cost-10 bcrypt is about a third of all CPU after Postgres's share. A bcrypt hash
 is ~1.07 million Blowfish encryptions, each a chain of dependent table lookups, so one hash leaves most of a core
-idle waiting on load latency. `src/bcrypt.c` computes up to 4 independent hashes at once in one thread,
+idle waiting on load latency. `src/passwd.c` computes up to 4 independent hashes at once in one thread,
 interleaving their encryptions so the chains overlap: on an i5-9500, 23.9 ms of CPU per hash instead of
 libxcrypt's 46 ms. Every hash is still full bcrypt at cost 10 and every login is verified against its stored
 hash (rule 7); only the scheduling changes. One bcrypt thread at a time lets a login wait up to 40 ms for others
@@ -209,7 +209,7 @@ batches in flight per connection, the FIFO length, and the mean batch latency pe
 
 Binary defaults (no env set) are derived from the usable CPUs; `start.sh` overrides with the limited-app
 defaults above (`THREADS=1`, `DB_CONNS=32`, `BCRYPT_THREADS=2`, ...), and any explicit environment wins over
-both. Pinning: `start.sh` confines the app with `taskset -c 0-3`; inside, `server.c` pins workers/bcrypt to
+both. Pinning: `start.sh` confines the app with `taskset -c 0-3`; inside, `evloop.c` pins workers/bcrypt to
 disjoint cores of its own affinity mask and reserves the remainder for Postgres.
 
 | Variable | Default | Meaning |
